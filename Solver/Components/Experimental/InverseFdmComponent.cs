@@ -21,8 +21,10 @@ public class InverseFdmComponent : GH_Component
 {
     private const string ParticularKey = "InverseFdmParticular";
     private const string LinearAlgebraKey = "InverseFdmLinearAlgebra";
+    private const string MetricKey = "InverseFdmMetric";
     private ParticularMode _particular = InverseFdmUiState.DefaultParticular;
     private LinearAlgebraMode _linearAlgebra = LinearAlgebraMode.Direct;
+    private MetricMode _metric = MetricMode.Force;
     private double _lambda = 1e-6;
     private bool _useL2 = true;
     private bool _solveForQ = false;
@@ -75,6 +77,9 @@ public class InverseFdmComponent : GH_Component
         pManager.AddNumberParameter("Member Forces", "Forces", "Target-geometry member forces", GH_ParamAccess.list);
         pManager.AddVectorParameter("Residual", "Residual", "Free-node equilibrium residual at the target", GH_ParamAccess.list);
         pManager.AddNumberParameter("Residual Ratio", "RelRes", "Residual norm divided by load norm", GH_ParamAccess.item);
+        pManager.AddNumberParameter("Geometric Error", "GeomErr",
+            "‖x(q) − x*‖: distance from the forward-solved geometry to the target. Unlike RelRes this is a length, not a force ratio.",
+            GH_ParamAccess.item);
     }
 
     protected override void SolveInstance(IGH_DataAccess DA)
@@ -171,6 +176,32 @@ public class InverseFdmComponent : GH_Component
             return;
         }
 
+        if (_metric != MetricMode.Force)
+        {
+            if (!InverseFdmUiState.SupportsGeometricMetric(_linearAlgebra, _particular, _hasBox))
+            {
+                AddRuntimeMessage(GH_RuntimeMessageLevel.Error,
+                    "The geometric metric cannot use Gram or QR least squares: both would need the "
+                    + "compliance-weighted matrix formed explicitly, which is dense. Choose Clarabel, "
+                    + "Moore–Penrose, or Tikhonov, or switch Linear algebra to Iterative.");
+                return;
+            }
+            if (!useL2)
+            {
+                AddRuntimeMessage(GH_RuntimeMessageLevel.Error,
+                    "The geometric metric requires L2 = true. IRLS reweights the force residual, which "
+                    + "has no agreed meaning once the rows carry the Laplacian compliance.");
+                return;
+            }
+            if (!HasPositiveLowerBound(signs, lower))
+            {
+                AddRuntimeMessage(GH_RuntimeMessageLevel.Warning,
+                    "The geometric metric weights by the FDM Laplacian, which is only invertible for "
+                    + "strictly positive q. Set Signs = +1 or a positive Lower bound, or the solve may "
+                    + "fail on a singular compliance.");
+            }
+        }
+
         double[] targetFreeXyz = new double[numFree * 3];
         for (int i = 0; i < numFree; i++)
         {
@@ -210,7 +241,8 @@ public class InverseFdmComponent : GH_Component
                 network, inputs, targetFreeXyz, effectiveRegularization,
                 useL2, maxL1Iter, particularMethod, (int)_linearAlgebra,
                 enforceZeroRx, enforceZeroRy, enforceZeroRz, solveForQ,
-                [.. signs], [.. lower], [.. upper], maxIter, tol);
+                [.. signs], [.. lower], [.. upper], maxIter, tol,
+                (int)_metric);
 
             if (_hasBox && _linearAlgebra == LinearAlgebraMode.Iterative && !result.Converged)
             {
@@ -230,8 +262,9 @@ public class InverseFdmComponent : GH_Component
             DA.SetDataList(4, forces);
             DA.SetDataList(5, residuals);
             DA.SetData(6, ratio);
+            DA.SetData(7, result.GeometricError);
 
-            if (ratio > 0.25)
+            if (ratio > 0.25 && _metric == MetricMode.Force)
             {
                 AddRuntimeMessage(GH_RuntimeMessageLevel.Warning,
                     $"Large residual ratio ({ratio:0.###}). The target/load combination may be inconsistent with equilibrium; Forces are from the particular at the target, Network is the forward solve.");
@@ -329,6 +362,12 @@ public class InverseFdmComponent : GH_Component
     {
         base.AppendAdditionalComponentMenuItems(menu);
         Menu_AppendSeparator(menu);
+        var metricMenu = new ToolStripMenuItem("Metric");
+        AppendMetricItem(metricMenu, "Force residual", MetricMode.Force);
+        AppendMetricItem(metricMenu, "Geometric (frozen target)", MetricMode.Geometry);
+        AppendMetricItem(metricMenu, "Geometric (Gauss–Newton)", MetricMode.GeometryNewton);
+        menu.Items.Add(metricMenu);
+        Menu_AppendSeparator(menu);
         Menu_AppendItem(menu, "Linear algebra: Direct", (_, _) => SetLinearAlgebra(LinearAlgebraMode.Direct), true, _linearAlgebra == LinearAlgebraMode.Direct);
         Menu_AppendItem(menu, "Linear algebra: Iterative", (_, _) => SetLinearAlgebra(LinearAlgebraMode.Iterative), true, _linearAlgebra == LinearAlgebraMode.Iterative);
         Menu_AppendSeparator(menu);
@@ -355,6 +394,36 @@ public class InverseFdmComponent : GH_Component
         };
         item.Click += (_, _) => SetParticular(mode);
         parent.DropDownItems.Add(item);
+    }
+
+    /// <summary>
+    /// True when every edge is pinned to positive q, which is what makes the
+    /// FDM Laplacian positive definite and its compliance well defined.
+    /// </summary>
+    private static bool HasPositiveLowerBound(IReadOnlyList<int> signs, IReadOnlyList<double> lower)
+    {
+        bool allTension = signs.Count > 0 && signs.All(sign => sign > 0);
+        bool allPositiveLower = lower.Count > 0 && lower.All(value => value > 0.0);
+        return allTension || allPositiveLower;
+    }
+
+    private void AppendMetricItem(ToolStripMenuItem parent, string label, MetricMode mode)
+    {
+        var item = new ToolStripMenuItem(label)
+        {
+            Checked = _metric == mode,
+        };
+        item.Click += (_, _) => SetMetric(mode);
+        parent.DropDownItems.Add(item);
+    }
+
+    private void SetMetric(MetricMode mode)
+    {
+        if (_metric == mode) return;
+        RecordUndoEvent("Set Inverse FDM Metric");
+        _metric = mode;
+        UpdateMessage();
+        ExpireSolution(true);
     }
 
     private void SetParticular(ParticularMode mode)
@@ -394,7 +463,13 @@ public class InverseFdmComponent : GH_Component
             ActiveInverseEngine.Lsqr => $"LSQR λ={FormatLambda(_lambda)}",
             _ => $"SPG λ={FormatLambda(_lambda)}",
         };
-        Message = $"{engineLabel} · {residual} · {unknown}";
+        string metricLabel = _metric switch
+        {
+            MetricMode.Geometry => " · Geom",
+            MetricMode.GeometryNewton => " · GeomGN",
+            _ => "",
+        };
+        Message = $"{engineLabel} · {residual} · {unknown}{metricLabel}";
     }
 
     private static string FormatLambda(double lambda)
@@ -407,6 +482,7 @@ public class InverseFdmComponent : GH_Component
     {
         writer.SetInt32(ParticularKey, (int)_particular);
         writer.SetInt32(LinearAlgebraKey, (int)_linearAlgebra);
+        writer.SetInt32(MetricKey, (int)_metric);
         return base.Write(writer);
     }
 
@@ -416,6 +492,8 @@ public class InverseFdmComponent : GH_Component
             _particular = (ParticularMode)reader.GetInt32(ParticularKey);
         if (reader.ItemExists(LinearAlgebraKey) && Enum.IsDefined(typeof(LinearAlgebraMode), reader.GetInt32(LinearAlgebraKey)))
             _linearAlgebra = (LinearAlgebraMode)reader.GetInt32(LinearAlgebraKey);
+        if (reader.ItemExists(MetricKey) && Enum.IsDefined(typeof(MetricMode), reader.GetInt32(MetricKey)))
+            _metric = (MetricMode)reader.GetInt32(MetricKey);
         UpdateMessage();
         return base.Read(reader);
     }
@@ -445,6 +523,49 @@ not go to 0 when the target is inconsistent with the box.
 These bounds clip the least-squares particular. They are <b>not</b> the
 length-preserving transform's sign cone, which stays in equilibrium by adding
 self-stress.
+</p>
+
+<br/>
+
+<h2>Metric (right-click)</h2>
+<p>
+Choosing what to minimise matters more than choosing a solver. In FDM the force
+residual at a frozen target is the geometric error pre-conditioned by the
+Laplacian:
+</p>
+<p>
+<code>r(q) = E(x*)q − p = D(q)(x* − x(q))</code>, so
+<code>x(q) − x* = −D(q)⁻¹ r(q)</code>.
+</p>
+<ul>
+<li><b>Force residual (default)</b> — minimises <code>‖r‖</code>. Every nodal
+force error counts the same regardless of how flexible that node is, so a small
+RelRes can still forward-solve far from the target. This is the historical
+behaviour and the right choice for a rigidity/particular question.</li>
+<li><b>Geometric (frozen target)</b> — minimises <code>‖D⁻¹r‖</code>, weighting
+each row by the compliance, with the Jacobian held at <code>x*</code>. An outer
+loop refreshes <code>D</code> at the current q.</li>
+<li><b>Geometric (Gauss–Newton)</b> — same weighting, but the Jacobian is
+re-assembled at the current form-found geometry <code>x(q_k)</code>. This is the
+true Gauss–Newton step for <code>‖x(q) − x*‖</code> and costs no forward solve,
+because <code>x(q_k) = x* − D⁻¹r_k</code>.</li>
+</ul>
+<p>
+Use a geometric metric when you want a <b>warm start</b>: a q whose form-found
+shape lands near the target. Use Force when you want the particular that best
+closes equilibrium at the frozen shape.
+</p>
+<p>
+The geometric metrics require <b>L2 = true</b> and a particular that can be
+left-weighted without densifying: Clarabel, Moore–Penrose, Tikhonov, LSQR, or
+SPG. <b>Gram and QR are rejected</b>, since both would need <code>S⁻¹M</code>
+formed explicitly. They also need <b>strictly positive q</b> (Signs = +1 or a
+positive Lower) so the Laplacian is invertible, and geometry-independent loads.
+</p>
+<p>
+λ becomes Levenberg–Marquardt damping on the step, and the q wire seeds the
+outer loop. <b>GeomErr</b> reports <code>‖x(q) − x*‖</code> for every metric, so
+Force and Geometric runs are directly comparable.
 </p>
 
 <br/>
@@ -516,6 +637,12 @@ unconstrained. Error if an interval is empty.</li>
 <b>Network / Nodes / Edges</b> come from the forward solve. <b>Forces / Residual / RelRes</b>
 are evaluated at the target geometry for the recovered particular.
 </p>
+<p>
+<b>GeomErr</b> is <code>‖x(q) − x*‖</code>, the distance from the forward-solved
+geometry to the target. It is a length, not a ratio, and it is the quantity a
+warm start should be judged on. RelRes near zero does <i>not</i> imply GeomErr
+near zero when the target is not funicular.
+</p>
 </body>
 </html>
 """;
@@ -535,6 +662,17 @@ internal enum ParticularMode
 }
 
 internal enum LinearAlgebraMode { Direct = 0, Iterative = 1 }
+
+/// <summary>Residual the inverse solve minimizes. Values match the native ABI.</summary>
+internal enum MetricMode
+{
+    /// <summary>Minimize the force residual ‖Mx − p‖.</summary>
+    Force = 0,
+    /// <summary>Minimize the geometric error with the Jacobian frozen at the target.</summary>
+    Geometry = 1,
+    /// <summary>Minimize the geometric error with the Jacobian at the current geometry.</summary>
+    GeometryNewton = 2,
+}
 
 internal enum ActiveInverseEngine
 {
@@ -566,6 +704,20 @@ internal static class InverseFdmUiState
         linearAlgebra == LinearAlgebraMode.Direct && hasEffectiveBounds
             ? ParticularMode.Clarabel
             : particular;
+
+    /// <summary>
+    /// Backends that can carry the Laplacian left weight without densifying.
+    /// Gram and QR would need S⁻¹M formed explicitly.
+    /// </summary>
+    internal static bool SupportsGeometricMetric(
+        LinearAlgebraMode linearAlgebra,
+        ParticularMode particular,
+        bool hasEffectiveBounds) =>
+        ResolveEngine(linearAlgebra, particular, hasEffectiveBounds) switch
+        {
+            ActiveInverseEngine.Gram or ActiveInverseEngine.QrLeastSquares => false,
+            _ => true,
+        };
 
     internal static int NativeParticularMethod(ParticularMode particular) =>
         particular switch

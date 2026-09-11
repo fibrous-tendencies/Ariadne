@@ -420,6 +420,11 @@ public sealed record SolveResult
     public required bool Converged { get; init; }
     /// <summary>Native optimizer termination reason when available.</summary>
     public string TerminationReason { get; init; } = "";
+    /// <summary>
+    /// For inverse solves, ‖x(q) − x*‖: the distance from the forward-solved
+    /// geometry to the target. NaN when unavailable.
+    /// </summary>
+    public double GeometricError { get; init; } = double.NaN;
 
     /// <summary>
     /// Node positions as Point3d list (convenience accessor).

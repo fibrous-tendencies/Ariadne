@@ -22,6 +22,12 @@ public sealed class SolverResult
     public int Iterations { get; init; }
     public bool Converged { get; init; }
     public string TerminationReason { get; init; } = "";
+
+    /// <summary>
+    /// ‖x(q) − x*‖ for inverse solves: how far the forward solve lands from the
+    /// target. NaN when not applicable or when the Laplacian was singular.
+    /// </summary>
+    public double GeometricError { get; init; } = double.NaN;
 }
 
 public enum RigidityMethod
@@ -779,6 +785,10 @@ public sealed class TheseusSolver : IDisposable
     /// particularMethod: 0 = Gram, 1 = Augmented, 2 = Sparse QR, 3 = Clarabel
     /// (Direct unconstrained only; constrained Direct always uses Clarabel).
     /// linearAlgebra: 0 = Direct, 1 = Iterative.
+    /// metric: 0 = Force (min ‖Mx − p‖), 1 = Geometry, 2 = GeometryNewton.
+    /// Geometric metrics weight the equilibrium rows by the Laplacian
+    /// compliance so the solve targets ‖x(q) − x*‖; they reject Gram, sparse
+    /// QR, and L1. A null qRef seeds the outer loop from the handle's q.
     public SolverResult SolveInverseFdm(
         double[] targetFreeXyz, double regularization,
         bool useL2 = true, int maxL1Iter = 20, int particularMethod = 3,
@@ -786,7 +796,8 @@ public sealed class TheseusSolver : IDisposable
         bool enforceZeroRx = false, bool enforceZeroRy = false,
         bool enforceZeroRz = false, bool solveForQ = true,
         int[]? signs = null, double[]? lower = null, double[]? upper = null,
-        int maxIter = 500, double tol = 1e-6)
+        int maxIter = 500, double tol = 1e-6,
+        int metric = 0, double[]? qRef = null, int maxOuter = 0)
     {
         ThrowIfDisposed();
         var q = new double[_numEdges];
@@ -796,11 +807,12 @@ public sealed class TheseusSolver : IDisposable
         var reactions = new double[_numNodes * 3];
         nuint iterations = 0;
         byte converged = 0;
+        double geometricError = double.NaN;
         int[] signsArr = signs ?? [];
         double[] lowerArr = lower ?? [];
         double[] upperArr = upper ?? [];
 
-        Check(TheseusInterop.theseus_solve_inverse_fdm(
+        Check(TheseusInterop.theseus_solve_inverse_fdm_metric(
             _handle, targetFreeXyz, regularization,
             useL2 ? 1 : 0, (nuint)maxL1Iter, particularMethod, linearAlgebra,
             enforceZeroRx ? 1 : 0, enforceZeroRy ? 1 : 0,
@@ -809,8 +821,9 @@ public sealed class TheseusSolver : IDisposable
             lowerArr, (nuint)lowerArr.Length,
             upperArr, (nuint)upperArr.Length,
             (nuint)maxIter, tol,
+            metric, qRef, (nuint)(qRef?.Length ?? 0), (nuint)maxOuter,
             q, xyz, lengths, forces, reactions,
-            ref iterations, ref converged));
+            ref iterations, ref converged, ref geometricError));
 
         return new SolverResult
         {
@@ -821,6 +834,7 @@ public sealed class TheseusSolver : IDisposable
             Reactions = reactions,
             Iterations = (int)iterations,
             Converged = converged != 0,
+            GeometricError = geometricError,
         };
     }
 

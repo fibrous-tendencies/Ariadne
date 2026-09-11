@@ -361,6 +361,21 @@ internal static class TheseusInterop
         ref nuint out_iterations, ref byte out_converged);
 
     [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int theseus_solve_inverse_fdm_metric(
+        IntPtr handle,
+        double[] target_free_xyz, double regularization,
+        int use_l2, nuint max_l1_iter, int particular_method, int linear_algebra,
+        int enforce_zero_rx, int enforce_zero_ry, int enforce_zero_rz, int solve_for_q,
+        int[] signs, nuint n_signs,
+        double[] lower, nuint n_lower,
+        double[] upper, nuint n_upper,
+        nuint max_iter, double tol,
+        int metric, double[]? q_ref, nuint n_q_ref, nuint max_outer,
+        double[] out_q, double[] out_xyz, double[] out_lengths,
+        double[] out_forces, double[] out_reactions,
+        ref nuint out_iterations, ref byte out_converged, ref double out_geom_error);
+
+    [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
     public static extern int theseus_rigidity_report_sizes(
         IntPtr handle,
         double[] target_free_xyz,

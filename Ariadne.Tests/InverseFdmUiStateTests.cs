@@ -101,4 +101,53 @@ public sealed class InverseFdmUiStateTests
                 ParticularMode.MoorePenrose,
                 hasEffectiveBounds: true));
     }
+
+    [Theory]
+    [InlineData(3)] // Gram
+    [InlineData(2)] // QrLeastSquares
+    public void GeometricMetricRejectsDensifyingDirectSolvers(int particularValue)
+    {
+        Assert.False(InverseFdmUiState.SupportsGeometricMetric(
+            LinearAlgebraMode.Direct,
+            (ParticularMode)particularValue,
+            hasEffectiveBounds: false));
+    }
+
+    [Theory]
+    [InlineData(4)] // Clarabel
+    [InlineData(0)] // MoorePenrose
+    [InlineData(1)] // Tikhonov
+    public void GeometricMetricAcceptsLeftWeightableDirectSolvers(int particularValue)
+    {
+        Assert.True(InverseFdmUiState.SupportsGeometricMetric(
+            LinearAlgebraMode.Direct,
+            (ParticularMode)particularValue,
+            hasEffectiveBounds: false));
+    }
+
+    [Theory]
+    [InlineData(3)] // Gram
+    [InlineData(2)] // QrLeastSquares
+    public void BoundsAndIterativeModesRouteAwayFromDensifyingSolvers(int particularValue)
+    {
+        // A finite box routes Direct to Clarabel and Iterative to SPG, so the
+        // geometric metric is available even when the menu still shows Gram/QR.
+        var particular = (ParticularMode)particularValue;
+        Assert.True(InverseFdmUiState.SupportsGeometricMetric(
+            LinearAlgebraMode.Direct,
+            particular,
+            hasEffectiveBounds: true));
+        Assert.True(InverseFdmUiState.SupportsGeometricMetric(
+            LinearAlgebraMode.Iterative,
+            particular,
+            hasEffectiveBounds: false));
+    }
+
+    [Fact]
+    public void MetricModeValuesMatchTheNativeAbi()
+    {
+        Assert.Equal(0, (int)MetricMode.Force);
+        Assert.Equal(1, (int)MetricMode.Geometry);
+        Assert.Equal(2, (int)MetricMode.GeometryNewton);
+    }
 }

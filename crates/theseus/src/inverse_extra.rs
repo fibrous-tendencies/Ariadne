@@ -174,15 +174,61 @@ fn solve_lsqr_on(
     lambda: f64,
     tol: f64,
     max_iter: usize,
+    weight: Option<&MetricWeight>,
 ) -> Result<crate::nullspace::LsqrResult, TheseusError> {
-    if lambda > 0.0 {
-        let stacked = stack_tikhonov(m_mat, lambda);
-        let mut rhs = vec![0.0; stacked.nrows];
-        rhs[..p.len()].copy_from_slice(p);
-        solve_lsqr(&stacked, &rhs, tol, max_iter)
-    } else {
-        solve_lsqr(m_mat, p, tol, max_iter)
-    }
+    let Some(w) = weight else {
+        if lambda > 0.0 {
+            let stacked = stack_tikhonov(m_mat, lambda);
+            let mut rhs = vec![0.0; stacked.nrows];
+            rhs[..p.len()].copy_from_slice(p);
+            return solve_lsqr(&stacked, &rhs, tol, max_iter);
+        }
+        return solve_lsqr(m_mat, p, tol, max_iter);
+    };
+
+    // Weighted: minimise ‖S⁻¹(Mx − p)‖² + λ‖x‖² over the operator S⁻¹M.
+    // The Tikhonov rows are appended inside the closures rather than
+    // materialised, since S⁻¹M has no sparse representation.
+    let m_rows = m_mat.nrows;
+    let n = m_mat.ncols;
+    let m_t = m_mat.transpose();
+    let damping = if lambda > 0.0 { lambda.sqrt() } else { 0.0 };
+    let rows = if damping > 0.0 { m_rows + n } else { m_rows };
+
+    let apply = |x: &[f64]| -> Result<Vec<f64>, TheseusError> {
+        let mut out = vec![0.0; rows];
+        let weighted = w.apply_inverse(&m_mat.matvec(x))?;
+        out[..m_rows].copy_from_slice(&weighted);
+        if damping > 0.0 {
+            for (j, &xj) in x.iter().enumerate() {
+                out[m_rows + j] = damping * xj;
+            }
+        }
+        Ok(out)
+    };
+    let apply_t = |y: &[f64]| -> Result<Vec<f64>, TheseusError> {
+        let weighted = w.apply_inverse(&y[..m_rows])?;
+        let mut out = m_t.matvec(&weighted);
+        if damping > 0.0 {
+            for (j, value) in out.iter_mut().enumerate() {
+                *value += damping * y[m_rows + j];
+            }
+        }
+        Ok(out)
+    };
+
+    let mut rhs = vec![0.0; rows];
+    rhs[..m_rows].copy_from_slice(&w.apply_inverse(p)?);
+    crate::nullspace::lsqr_operator(
+        apply,
+        apply_t,
+        rows,
+        n,
+        &rhs,
+        l2_norm_prefix(&m_mat.values, m_mat.values.len()),
+        tol,
+        max_iter,
+    )
 }
 
 fn ldl_solve_cached(
@@ -248,6 +294,69 @@ fn solve_gram_on(
     ldl_solve_cached(&g, &h, lambda, cache, factor_stack, solve_stack)
 }
 
+/// Build the weighted 3-block KKT system for `min ½‖e‖² + ½λ‖q‖²`
+/// subject to `S e − M q = −p`.
+///
+/// Stationarity of the Lagrangian in `(e, q, y)` gives the symmetric
+/// indefinite system
+///
+/// ```text
+/// [ I    0    Sᵀ ] [e]   [ 0 ]
+/// [ 0   λI   −Mᵀ ] [q] = [ 0 ]
+/// [ S   −M    0  ] [y]   [−p ]
+/// ```
+///
+/// Every block is sparse, so this is the weighted analogue of
+/// [`build_augmented_system`] without ever forming `S⁻¹M`.
+fn build_weighted_saddle(
+    m_mat: &SparseColMatOwned,
+    s_mat: &SparseColMatOwned,
+    p: &[f64],
+    lambda: f64,
+) -> (SparseColMatOwned, Vec<f64>) {
+    let m = m_mat.nrows;
+    let n = m_mat.ncols;
+    let total = 2 * m + n;
+    let y0 = m + n;
+
+    let mut triplets: Vec<(u32, u32, f64)> = Vec::with_capacity(m + n + 4 * m_mat.nnz());
+
+    // (1,1) = I
+    for i in 0..m {
+        triplets.push((i as u32, i as u32, 1.0));
+    }
+    // (2,2) = λI
+    for j in 0..n {
+        triplets.push(((m + j) as u32, (m + j) as u32, lambda));
+    }
+    // (1,3) = Sᵀ and (3,1) = S
+    for col in 0..s_mat.ncols {
+        for nz in s_mat.col_ptrs[col] as usize..s_mat.col_ptrs[col + 1] as usize {
+            let row = s_mat.row_indices[nz] as usize;
+            let value = s_mat.values[nz];
+            triplets.push((col as u32, (y0 + row) as u32, value));
+            triplets.push(((y0 + row) as u32, col as u32, value));
+        }
+    }
+    // (2,3) = −Mᵀ and (3,2) = −M
+    for col in 0..n {
+        for nz in m_mat.col_ptrs[col] as usize..m_mat.col_ptrs[col + 1] as usize {
+            let row = m_mat.row_indices[nz] as usize;
+            let value = -m_mat.values[nz];
+            triplets.push(((m + col) as u32, (y0 + row) as u32, value));
+            triplets.push(((y0 + row) as u32, (m + col) as u32, value));
+        }
+    }
+
+    let k_mat =
+        SparseColMatOwned::from_triplets(total, total, &triplets).expect("build_weighted_saddle");
+    let mut rhs = vec![0.0; total];
+    for (i, &pi) in p.iter().enumerate() {
+        rhs[y0 + i] = -pi;
+    }
+    (k_mat, rhs)
+}
+
 fn solve_saddle_on(
     m_mat: &SparseColMatOwned,
     p: &[f64],
@@ -255,12 +364,18 @@ fn solve_saddle_on(
     cache: &mut Option<Factorization>,
     factor_stack: &mut GlobalPodBuffer,
     solve_stack: &mut GlobalPodBuffer,
+    weight: Option<&MetricWeight>,
 ) -> Result<Vec<f64>, TheseusError> {
+    let m = p.len();
+    let n = m_mat.ncols;
+    if let Some(w) = weight {
+        let (k_mat, rhs) = build_weighted_saddle(m_mat, &w.s, p, lambda);
+        let sol = ldl_solve_cached(&k_mat, &rhs, lambda, cache, factor_stack, solve_stack)?;
+        return Ok(sol[m..m + n].to_vec());
+    }
     if lambda == 0.0 {
         return solve_saddle_pseudoinverse(m_mat, p, lambda, 1e-11, 0);
     }
-    let m = p.len();
-    let n = m_mat.ncols;
     let (k_mat, rhs) = build_augmented_system(m_mat, p, lambda);
     let sol = ldl_solve_cached(&k_mat, &rhs, lambda, cache, factor_stack, solve_stack)?;
     Ok(sol[m..m + n].to_vec())
@@ -380,11 +495,17 @@ fn to_clarabel_csc(mat: &SparseColMatOwned) -> Result<clarabel::algebra::CscMatr
     Ok(csc)
 }
 
+/// Split-variable QP: `min ½‖e‖² + ½λ‖q‖²` s.t. `S e − M q = −p`, `q` in box.
+///
+/// With no weight, `S = I` pins `e` to the plain force residual `Mq − p`.
+/// Under the geometric metric `S` is the sparse Laplacian block, so `e` becomes
+/// `S⁻¹(Mq − p)`, the geometric error, and the inverse is never formed.
 fn solve_clarabel_once(
     m_mat: &SparseColMatOwned,
     p: &[f64],
     lambda: f64,
     bounds: &BoxBounds,
+    weight: Option<&MetricWeight>,
 ) -> Result<Vec<f64>, TheseusError> {
     use clarabel::algebra::CscMatrix;
     use clarabel::solver::{DefaultSettings, DefaultSolver, IPSolver, SolverStatus, SupportedConeT};
@@ -416,8 +537,19 @@ fn solve_clarabel_once(
     let q_lin = vec![0.0; n_var];
 
     let mut a_triplets: Vec<(u32, u32, f64)> = Vec::new();
-    for i in 0..m {
-        a_triplets.push((i as u32, i as u32, 1.0));
+    match weight {
+        None => {
+            for i in 0..m {
+                a_triplets.push((i as u32, i as u32, 1.0));
+            }
+        }
+        Some(w) => {
+            for col in 0..w.s.ncols {
+                for nz in w.s.col_ptrs[col] as usize..w.s.col_ptrs[col + 1] as usize {
+                    a_triplets.push((w.s.row_indices[nz], col as u32, w.s.values[nz]));
+                }
+            }
+        }
     }
     for col in 0..n {
         for nz in m_mat.col_ptrs[col] as usize..m_mat.col_ptrs[col + 1] as usize {
@@ -469,10 +601,11 @@ fn solve_clarabel_box(
     p: &[f64],
     lambda: f64,
     bounds: &BoxBounds,
+    weight: Option<&MetricWeight>,
 ) -> Result<Vec<f64>, TheseusError> {
-    match solve_clarabel_once(m_mat, p, lambda, bounds) {
+    match solve_clarabel_once(m_mat, p, lambda, bounds, weight) {
         Ok(x) => Ok(x),
-        Err(_) if lambda == 0.0 => solve_clarabel_once(m_mat, p, 1e-12, bounds),
+        Err(_) if lambda == 0.0 => solve_clarabel_once(m_mat, p, 1e-12, bounds, weight),
         Err(error) => Err(error),
     }
 }
@@ -485,6 +618,7 @@ fn solve_spg_on(
     max_iter: usize,
     tol: f64,
     x0: &[f64],
+    weight: Option<&MetricWeight>,
 ) -> Result<SpgBoxResult, TheseusError> {
     let n = m_mat.ncols;
     let m_t = m_mat.transpose();
@@ -502,6 +636,12 @@ fn solve_spg_on(
         let mut r = m_mat.matvec(&x);
         for (ri, &pi) in r.iter_mut().zip(p.iter()) {
             *ri -= pi;
+        }
+        // Objective ½‖S⁻¹(Mx − p)‖² has gradient Mᵀ S⁻ᵀ S⁻¹ (Mx − p); S is
+        // symmetric, so S⁻¹ is applied twice.
+        if let Some(w) = weight {
+            r = w.apply_inverse(&r)?;
+            r = w.apply_inverse(&r)?;
         }
         let mut g = m_t.matvec(&r);
         if lambda > 0.0 {
@@ -565,6 +705,265 @@ fn irls_weights(residual: &[f64]) -> (Vec<f64>, f64, f64) {
     (sqrt_w, l1_obj, w_max)
 }
 
+// ─────────────────────────────────────────────────────────────
+//  Geometric metric  (Laplacian compliance weighting)
+// ─────────────────────────────────────────────────────────────
+
+/// Euclidean norm of the first `len` entries.
+fn l2_norm_prefix(v: &[f64], len: usize) -> f64 {
+    v[..len.min(v.len())]
+        .iter()
+        .map(|x| x * x)
+        .sum::<f64>()
+        .sqrt()
+}
+
+/// Create a copy of a CSC matrix with each column `j` scaled by `scales[j]`.
+fn col_scaled_copy(mat: &SparseColMatOwned, scales: &[f64]) -> SparseColMatOwned {
+    let mut scaled = mat.clone();
+    for (col, &scale) in scales.iter().enumerate().take(scaled.ncols) {
+        let start = scaled.col_ptrs[col] as usize;
+        let end_ = scaled.col_ptrs[col + 1] as usize;
+        for nz in start..end_ {
+            scaled.values[nz] *= scale;
+        }
+    }
+    scaled
+}
+
+/// Left weight `S` for the geometric metric.
+///
+/// `S = blkdiag(D, D, D, I)` over the axis-major equilibrium rows, where
+/// `D = Cnᵀ diag(q) Cn` is the FDM Laplacian. The trailing identity covers the
+/// optional zero-reaction rows, which are support constraints rather than
+/// free-node equilibrium and carry no compliance.
+///
+/// `S` is kept assembled for the backends that embed it (Clarabel, saddle);
+/// `D` is kept factored for the backends that apply `S⁻¹` per matvec (LSQR,
+/// SPG) and for evaluating the exact geometric error. `D` is never inverted.
+struct MetricWeight {
+    s: SparseColMatOwned,
+    d_factor: Factorization,
+    n_free: usize,
+    n_eq: usize,
+    workspace: std::cell::RefCell<Vec<f64>>,
+    stack: std::cell::RefCell<GlobalPodBuffer>,
+}
+
+impl MetricWeight {
+    /// Assemble and factor the weight at force densities `q`.
+    fn build(problem: &Problem, q: &[f64], n_eq: usize, n_free: usize) -> Result<Self, TheseusError> {
+        let cn = &problem.topology.free_incidence;
+        let cn_t = cn.transpose();
+        let scaled = row_scaled_copy(cn, q);
+        let d = SparseColMatOwned::sparse_times_sparse(&cn_t, &scaled)
+            .map_err(TheseusError::Solver)?;
+
+        // S = blkdiag(D, D, D, I) in axis-major row order.
+        let mut triplets = Vec::with_capacity(3 * d.nnz() + (n_eq - 3 * n_free));
+        for col in 0..d.ncols {
+            for nz in d.col_ptrs[col] as usize..d.col_ptrs[col + 1] as usize {
+                let row = d.row_indices[nz] as usize;
+                let value = d.values[nz];
+                for axis in 0..3 {
+                    let offset = axis * n_free;
+                    triplets.push(((offset + row) as u32, (offset + col) as u32, value));
+                }
+            }
+        }
+        for row in (3 * n_free)..n_eq {
+            triplets.push((row as u32, row as u32, 1.0));
+        }
+        let s = SparseColMatOwned::from_triplets(n_eq, n_eq, &triplets)
+            .map_err(TheseusError::Shape)?;
+
+        // A strictly positive q makes D symmetric positive definite, so the
+        // Cholesky path applies; anything else needs the indefinite factor.
+        let strategy = if q.iter().all(|&v| v > 0.0) {
+            FactorizationStrategy::Cholesky
+        } else {
+            FactorizationStrategy::LDL
+        };
+        let mut stack = GlobalPodBuffer::new(dyn_stack::StackReq::empty());
+        let d_factor = Factorization::new(&d, strategy, &mut stack).map_err(|_| {
+            TheseusError::Solver(
+                "geometric metric: the FDM Laplacian Cnᵀ diag(q) Cn is singular or \
+                 indefinite at the current q. Bound q strictly positive (Signs = +1 \
+                 or a positive Lower) so the compliance D⁻¹ exists."
+                    .into(),
+            )
+        })?;
+
+        Ok(Self {
+            s,
+            d_factor,
+            n_free,
+            n_eq,
+            workspace: std::cell::RefCell::new(vec![0.0; (n_free * 3).max(1)]),
+            stack: std::cell::RefCell::new(stack),
+        })
+    }
+
+    /// Apply `S⁻¹` to an equilibrium-row vector.
+    ///
+    /// Solves the three axis blocks in one triangular solve and passes the
+    /// reaction rows through unchanged.
+    fn apply_inverse(&self, r: &[f64]) -> Result<Vec<f64>, TheseusError> {
+        if r.len() != self.n_eq {
+            return Err(TheseusError::Shape(format!(
+                "geometric weight expected {} rows, got {}",
+                self.n_eq,
+                r.len()
+            )));
+        }
+        let n_free = self.n_free;
+        let mut out = vec![0.0; self.n_eq];
+        if n_free > 0 {
+            let rhs = Array2::from_shape_fn((n_free, 3), |(i, axis)| r[axis * n_free + i]);
+            let mut x = Array2::zeros((n_free, 3));
+            let mut workspace = self.workspace.borrow_mut();
+            let mut stack = self.stack.borrow_mut();
+            if workspace.len() < n_free * 3 {
+                workspace.resize(n_free * 3, 0.0);
+            }
+            self.d_factor
+                .solve_into(&rhs, &mut x, &mut workspace, &mut stack)?;
+            for axis in 0..3 {
+                for i in 0..n_free {
+                    let value = x[[i, axis]];
+                    if !value.is_finite() {
+                        return Err(TheseusError::Solver(
+                            "geometric metric: applying D⁻¹ produced a non-finite value; \
+                             the Laplacian is effectively singular at the current q"
+                                .into(),
+                        ));
+                    }
+                    out[axis * n_free + i] = value;
+                }
+            }
+        }
+        out[3 * n_free..].copy_from_slice(&r[3 * n_free..]);
+        Ok(out)
+    }
+}
+
+/// Current geometry and error for an unknown vector under the geometric metric.
+struct GeometryProbe {
+    weight: MetricWeight,
+    /// `S⁻¹ r = x* − x(q)`, the negated geometric error.
+    neg_error: Vec<f64>,
+    /// `‖x(q) − x*‖` over the free-node rows only.
+    error: f64,
+}
+
+/// Evaluate the exact geometric error at an unknown vector.
+///
+/// Uses the identity `x(q) − x* = −D(q)⁻¹(E(x*)q − p)`, so no forward solve is
+/// needed. Exact for geometry-independent loads.
+fn probe_geometry(
+    problem: &Problem,
+    system: &EquilibriumSystem,
+    unknown: &[f64],
+    solve_for_q: bool,
+) -> Result<GeometryProbe, TheseusError> {
+    let q = if solve_for_q {
+        unknown.to_vec()
+    } else {
+        forces_to_q(unknown, &system.lengths)
+    };
+    let weight = MetricWeight::build(problem, &q, system.n_eq, system.n_free)?;
+    let mut r = system.a.matvec(unknown);
+    for (ri, &pi) in r.iter_mut().zip(system.p.iter()) {
+        *ri -= pi;
+    }
+    let neg_error = weight.apply_inverse(&r)?;
+    let error = l2_norm_prefix(&neg_error, 3 * system.n_free);
+    Ok(GeometryProbe {
+        weight,
+        neg_error,
+        error,
+    })
+}
+
+/// Exact offset from the forward-solved geometry to the target, `x(q) − x*`,
+/// as an `n_free × 3` array.
+///
+/// Evaluated through the identity `x(q) − x* = −D(q)⁻¹(E(x*)q − p)` rather than
+/// by running a forward solve, so it costs one Laplacian factorisation. Exact
+/// whenever the loads do not move with the geometry; with self-weight or
+/// pressure active the forward solve is the authority.
+pub fn geometric_error_vector(
+    problem: &Problem,
+    target_free_xyz: &Array2<f64>,
+    q: &[f64],
+) -> Result<Array2<f64>, TheseusError> {
+    let system = EquilibriumSystem::assemble(
+        problem,
+        target_free_xyz,
+        EquilibriumUnknown::ForceDensity,
+        false,
+        false,
+        false,
+    )?;
+    let probe = probe_geometry(problem, &system, q, true)?;
+    let n_free = system.n_free;
+    // probe.neg_error is x* − x(q).
+    Ok(Array2::from_shape_fn((n_free, 3), |(i, d)| {
+        -probe.neg_error[d * n_free + i]
+    }))
+}
+
+/// Reject metric/backend combinations that cannot be left-weighted sparsely.
+fn validate_geometric_options(
+    problem: &Problem,
+    opts: &InverseFdmOptions,
+    kind: InnerKind,
+) -> Result<(), TheseusError> {
+    if !opts.use_l2 {
+        return Err(TheseusError::Solver(
+            "geometric metric does not support L1/IRLS. The IRLS reweighting is a \
+             diagonal row scaling of the force residual, which has no agreed meaning \
+             once the rows are already weighted by the Laplacian compliance. Set L2 = true."
+                .into(),
+        ));
+    }
+    if matches!(kind, InnerKind::Gram | InnerKind::Qr) {
+        return Err(TheseusError::Solver(
+            "geometric metric cannot use Gram or sparse QR: both need S⁻¹M formed \
+             explicitly, which is dense. Use Clarabel, Moore–Penrose/Tikhonov \
+             (augmented saddle), or switch to Iterative for LSQR/SPG."
+                .into(),
+        ));
+    }
+    if problem.self_weight.is_some() || problem.pressure.is_some() {
+        return Err(TheseusError::Solver(
+            "geometric metric requires geometry-independent loads, but self-weight or \
+             pressure is active. The identity x(q) − x* = −D(q)⁻¹r(q) assumes the load \
+             vector does not move with the geometry."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Shift a box from the unknown `x` to the step `Δ`: `lo − x ≤ Δ ≤ hi − x`.
+fn shift_box(bounds: &BoxBounds, x: &[f64]) -> BoxBounds {
+    BoxBounds {
+        lower: bounds
+            .lower
+            .iter()
+            .zip(x)
+            .map(|(&lo, &xi)| lo - xi)
+            .collect(),
+        upper: bounds
+            .upper
+            .iter()
+            .zip(x)
+            .map(|(&hi, &xi)| hi - xi)
+            .collect(),
+    }
+}
+
 /// Solve the inverse-FDM particular with Direct/Iterative linear algebra,
 /// optional box bounds, and optional IRLS.
 pub fn solve_inverse_fdm(
@@ -602,7 +1001,9 @@ pub fn solve_inverse_fdm(
     let mut solve_inner = |m_mat: &SparseColMatOwned,
                            p: &[f64],
                            lambda: f64,
-                           x0: &[f64]|
+                           x0: &[f64],
+                           box_bounds: &BoxBounds,
+                           weight: Option<&MetricWeight>|
      -> Result<(Vec<f64>, usize, bool), TheseusError> {
         match kind {
             InnerKind::Gram => Ok((
@@ -625,6 +1026,7 @@ pub fn solve_inverse_fdm(
                     &mut ldl_cache,
                     &mut factor_stack,
                     &mut solve_stack,
+                    weight,
                 )?,
                 1,
                 true,
@@ -632,19 +1034,43 @@ pub fn solve_inverse_fdm(
             InnerKind::Qr => Ok((solve_qr_on(m_mat, p, true, &mut qr_symbolic)?, 1, true)),
             InnerKind::Lsqr => {
                 let result =
-                    solve_lsqr_on(m_mat, p, lambda, opts.tol.max(1e-11), opts.max_iter)?;
+                    solve_lsqr_on(m_mat, p, lambda, opts.tol.max(1e-11), opts.max_iter, weight)?;
                 Ok((result.solution, result.iterations, result.converged))
             }
-            InnerKind::Clarabel => Ok((solve_clarabel_box(m_mat, p, lambda, &bounds)?, 1, true)),
+            InnerKind::Clarabel => Ok((
+                solve_clarabel_box(m_mat, p, lambda, box_bounds, weight)?,
+                1,
+                true,
+            )),
             InnerKind::Spg => {
-                let result = solve_spg_on(m_mat, p, lambda, &bounds, opts.max_iter, opts.tol, x0)?;
+                let result = solve_spg_on(
+                    m_mat,
+                    p,
+                    lambda,
+                    box_bounds,
+                    opts.max_iter,
+                    opts.tol,
+                    x0,
+                    weight,
+                )?;
                 Ok((result.q, result.iterations, result.converged))
             }
         }
     };
 
-    let (mut x, mut iterations, mut converged) =
-        solve_inner(&system.a, &system.p, opts.regularization, &start)?;
+    if opts.metric.is_geometric() {
+        validate_geometric_options(problem, &opts, kind)?;
+        return solve_geometric_outer(problem, &system, &opts, &bounds, &mut solve_inner);
+    }
+
+    let (mut x, mut iterations, mut converged) = solve_inner(
+        &system.a,
+        &system.p,
+        opts.regularization,
+        &start,
+        &bounds,
+        None,
+    )?;
     clip_to_box(&mut x, &bounds);
 
     if !opts.use_l2 {
@@ -674,7 +1100,8 @@ pub fn solve_inverse_fdm(
                 opts.regularization
             };
             start.copy_from_slice(&x);
-            let (next, _inner_iters, inner_ok) = solve_inner(&m_w, &p_w, effective_reg, &start)?;
+            let (next, _inner_iters, inner_ok) =
+                solve_inner(&m_w, &p_w, effective_reg, &start, &bounds, None)?;
             x = next;
             clip_to_box(&mut x, &bounds);
             iterations = outer + 1;
@@ -683,6 +1110,11 @@ pub fn solve_inverse_fdm(
     }
 
     validate_unknown(&x, ne, "inverse FDM")?;
+    // Report the geometric error even for a force-metric solve so the two are
+    // comparable on the same scale. A singular Laplacian just means "unknown".
+    let geometric_error = probe_geometry(problem, &system, &x, opts.solve_for_q)
+        .map(|probe| probe.error)
+        .unwrap_or(f64::NAN);
     let q = if opts.solve_for_q {
         x
     } else {
@@ -692,6 +1124,173 @@ pub fn solve_inverse_fdm(
         q,
         iterations,
         converged,
+        geometric_error,
+    })
+}
+
+/// Outer loop for the geometric metrics.
+///
+/// Each iteration rebuilds the compliance at the current q, measures the exact
+/// geometric error, solves one weighted least-squares step, and backtracks on
+/// the measured error. The step form makes the existing λ act as
+/// Levenberg--Marquardt damping.
+fn solve_geometric_outer<F>(
+    problem: &Problem,
+    system: &EquilibriumSystem,
+    opts: &InverseFdmOptions,
+    bounds: &BoxBounds,
+    solve_inner: &mut F,
+) -> Result<InverseFdmResult, TheseusError>
+where
+    F: FnMut(
+        &SparseColMatOwned,
+        &[f64],
+        f64,
+        &[f64],
+        &BoxBounds,
+        Option<&MetricWeight>,
+    ) -> Result<(Vec<f64>, usize, bool), TheseusError>,
+{
+    const MAX_BACKTRACK: usize = 4;
+    let ne = problem.topology.num_edges;
+
+    // Seed: caller-supplied reference q, else q_e = 1/L_e at the target, which
+    // is a taut net rather than the floppy min-norm particular.
+    let q_seed: Vec<f64> = if opts.q_ref.is_empty() {
+        system.lengths.iter().map(|&l| 1.0 / l).collect()
+    } else {
+        if opts.q_ref.len() != ne {
+            return Err(TheseusError::Shape(format!(
+                "q_ref has {} entries, expected {ne}",
+                opts.q_ref.len()
+            )));
+        }
+        opts.q_ref.clone()
+    };
+    // The unknown is t when solving in force coordinates; t = diag(L*) q.
+    let mut x: Vec<f64> = if opts.solve_for_q {
+        q_seed
+    } else {
+        q_seed
+            .iter()
+            .zip(&system.lengths)
+            .map(|(q, l)| q * l)
+            .collect()
+    };
+    clip_to_box(&mut x, bounds);
+
+    let mut probe = probe_geometry(problem, system, &x, opts.solve_for_q)?;
+    let mut best_x = x.clone();
+    let mut best_error = probe.error;
+    let mut iterations = 0;
+    let mut converged = false;
+    let max_outer = opts.max_outer.max(1);
+
+    for outer in 0..max_outer {
+        iterations = outer + 1;
+
+        // r_k is always measured against the target; only the Jacobian moves.
+        let mut r = system.a.matvec(&x);
+        for (ri, &pi) in r.iter_mut().zip(system.p.iter()) {
+            *ri -= pi;
+        }
+
+        let jacobian = match opts.metric {
+            InverseMetric::Force => unreachable!("force metric does not reach the outer loop"),
+            InverseMetric::Geometry => None,
+            InverseMetric::GeometryNewton => {
+                // x(q_k) = x* + e_k = x* − S⁻¹r_k, no forward solve needed.
+                let n_free = system.n_free;
+                let current = Array2::from_shape_fn((n_free, 3), |(i, d)| {
+                    system.free_positions[[i, d]] - probe.neg_error[d * n_free + i]
+                });
+                let at_current = EquilibriumSystem::assemble(
+                    problem,
+                    &current,
+                    EquilibriumUnknown::ForceDensity,
+                    opts.enforce_zero_rx,
+                    opts.enforce_zero_ry,
+                    opts.enforce_zero_rz,
+                )?;
+                // dx/dt = dx/dq · diag(1/L*), and L* are the target lengths,
+                // not the lengths at the current geometry.
+                Some(if opts.solve_for_q {
+                    at_current.a
+                } else {
+                    let inv_target_lengths: Vec<f64> =
+                        system.lengths.iter().map(|&l| 1.0 / l).collect();
+                    col_scaled_copy(&at_current.a, &inv_target_lengths)
+                })
+            }
+        };
+        let jacobian = jacobian.as_ref().unwrap_or(&system.a);
+
+        let neg_r: Vec<f64> = r.iter().map(|v| -v).collect();
+        let step_bounds = shift_box(bounds, &x);
+        let zero_start = vec![0.0; ne];
+        // The inner convergence flag is advisory only: acceptance is decided by
+        // the measured geometric error below.
+        let (step, _inner_iters, _inner_ok) = solve_inner(
+            jacobian,
+            &neg_r,
+            opts.regularization,
+            &zero_start,
+            &step_bounds,
+            Some(&probe.weight),
+        )?;
+        validate_unknown(&step, ne, "geometric step")?;
+
+        // Backtrack on the measured error; the linear model can overshoot when
+        // the target is far from funicular.
+        let mut accepted = false;
+        let mut scale = 1.0;
+        for _ in 0..MAX_BACKTRACK {
+            let mut candidate: Vec<f64> = x
+                .iter()
+                .zip(&step)
+                .map(|(&xi, &di)| xi + scale * di)
+                .collect();
+            clip_to_box(&mut candidate, bounds);
+            if let Ok(next) = probe_geometry(problem, system, &candidate, opts.solve_for_q) {
+                if next.error < probe.error {
+                    let improvement =
+                        (probe.error - next.error) / probe.error.max(f64::MIN_POSITIVE);
+                    x = candidate;
+                    probe = next;
+                    accepted = true;
+                    if probe.error < best_error {
+                        best_error = probe.error;
+                        best_x = x.clone();
+                    }
+                    converged = improvement < opts.tol.max(1e-12);
+                    break;
+                }
+            }
+            scale *= 0.5;
+        }
+
+        if !accepted {
+            // No downhill step along this direction; the linear model has
+            // nothing left to offer and the best-so-far point stands.
+            converged = true;
+            break;
+        }
+        if converged {
+            break;
+        }
+    }
+
+    validate_unknown(&best_x, ne, "inverse FDM (geometric)")?;
+    let q = if opts.solve_for_q {
+        best_x
+    } else {
+        forces_to_q(&best_x, &system.lengths)
+    };
+    Ok(InverseFdmResult {
+        q,
+        iterations,
+        converged,
+        geometric_error: best_error,
     })
 }
 
@@ -728,6 +1327,9 @@ pub fn solve_spg_box(
             upper: upper.to_vec(),
             max_iter,
             tol,
+            metric: InverseMetric::Force,
+            q_ref: Vec::new(),
+            max_outer: DEFAULT_MAX_OUTER,
         },
     )?;
     Ok(SpgBoxResult {
@@ -736,6 +1338,8 @@ pub fn solve_spg_box(
         converged: result.converged,
     })
 }
+
+// (geometric helpers live above `solve_inverse_fdm`)
 
 /// Create a copy of a CSC matrix with each row `i` scaled by `row_scales[i]`.
 fn row_scaled_copy(mat: &SparseColMatOwned, row_scales: &[f64]) -> SparseColMatOwned {

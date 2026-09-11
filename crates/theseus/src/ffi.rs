@@ -2710,6 +2710,7 @@ pub unsafe extern "C" fn theseus_classify_prestress(
 /// # Safety
 /// Valid handle and output buffers.
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn theseus_solve_inverse_fdm(
     handle: *mut TheseusHandle,
     target_free_xyz: *const f64,
@@ -2737,6 +2738,100 @@ pub unsafe extern "C" fn theseus_solve_inverse_fdm(
     out_reactions: *mut f64,
     out_iterations: *mut usize,
     out_converged: *mut bool,
+) -> i32 {
+    theseus_solve_inverse_fdm_metric(
+        handle,
+        target_free_xyz,
+        regularization,
+        use_l2,
+        max_l1_iter,
+        particular_method,
+        linear_algebra,
+        enforce_zero_rx,
+        enforce_zero_ry,
+        enforce_zero_rz,
+        solve_for_q,
+        signs,
+        n_signs,
+        lower,
+        n_lower,
+        upper,
+        n_upper,
+        max_iter,
+        tol,
+        // metric = Force reproduces the historical solve exactly.
+        0,
+        std::ptr::null(),
+        0,
+        0,
+        out_q,
+        out_xyz,
+        out_lengths,
+        out_forces,
+        out_reactions,
+        out_iterations,
+        out_converged,
+        std::ptr::null_mut(),
+    )
+}
+
+/// Solve inverse FDM at a target geometry under a selectable residual metric,
+/// then forward-solve.
+///
+/// Extends [`theseus_solve_inverse_fdm`] with the geometric metric controls.
+///
+/// `metric` ABI mapping (append-only):
+/// 0 = Force (`min ‖Mx − p‖`, historical), 1 = Geometry (weighted by the
+/// Laplacian compliance, Jacobian frozen at the target), 2 = GeometryNewton
+/// (same weighting, Jacobian re-assembled at the current form-found geometry).
+///
+/// Geometric metrics require a particular method that can be left-weighted
+/// without densifying: Clarabel, augmented saddle, LSQR, or SPG. Gram and
+/// sparse QR are rejected.
+///
+/// `q_ref` seeds the geometric outer loop and must hold `num_edges` doubles
+/// when non-null; a null pointer falls back to the handle's current q.
+/// `max_outer` of 0 selects the built-in default.
+/// `out_geom_error` receives `‖x(q) − x*‖` and may be null.
+///
+/// Returns 0 on success, -1 on error, -2 on internal panic.
+///
+/// # Safety
+/// Valid handle and output buffers.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn theseus_solve_inverse_fdm_metric(
+    handle: *mut TheseusHandle,
+    target_free_xyz: *const f64,
+    regularization: f64,
+    use_l2: i32,
+    max_l1_iter: usize,
+    particular_method: i32,
+    linear_algebra: i32,
+    enforce_zero_rx: i32,
+    enforce_zero_ry: i32,
+    enforce_zero_rz: i32,
+    solve_for_q: i32,
+    signs: *const i32,
+    n_signs: usize,
+    lower: *const f64,
+    n_lower: usize,
+    upper: *const f64,
+    n_upper: usize,
+    max_iter: usize,
+    tol: f64,
+    metric: i32,
+    q_ref: *const f64,
+    n_q_ref: usize,
+    max_outer: usize,
+    out_q: *mut f64,
+    out_xyz: *mut f64,
+    out_lengths: *mut f64,
+    out_forces: *mut f64,
+    out_reactions: *mut f64,
+    out_iterations: *mut usize,
+    out_converged: *mut bool,
+    out_geom_error: *mut f64,
 ) -> i32 {
     ffi_guard(AssertUnwindSafe(|| {
         let h = require_handle(handle)?;
@@ -2767,6 +2862,29 @@ pub unsafe extern "C" fn theseus_solve_inverse_fdm(
 
         let method = crate::inverse::ParticularMethod::try_from(particular_method)?;
         let algebra = crate::inverse::LinearAlgebra::try_from(linear_algebra)?;
+        let metric = crate::inverse::InverseMetric::try_from(metric)?;
+
+        // A null q_ref falls back to the handle's current force densities,
+        // which carry whatever q_init the caller created the handle with.
+        let q_ref = if metric.is_geometric() {
+            if q_ref.is_null() || n_q_ref == 0 {
+                h.state.force_densities.clone()
+            } else {
+                if n_q_ref != ne {
+                    return Err(TheseusError::Shape(format!(
+                        "q_ref has {n_q_ref} entries, expected {ne}"
+                    )));
+                }
+                slice::from_raw_parts(q_ref, n_q_ref).to_vec()
+            }
+        } else {
+            Vec::new()
+        };
+        let max_outer = if max_outer == 0 {
+            crate::inverse::DEFAULT_MAX_OUTER
+        } else {
+            max_outer
+        };
         let result = crate::inverse::solve_inverse_fdm(
             &h.problem,
             &target,
@@ -2785,6 +2903,9 @@ pub unsafe extern "C" fn theseus_solve_inverse_fdm(
                 upper: copy_f64(upper, n_upper),
                 max_iter,
                 tol,
+                metric,
+                q_ref,
+                max_outer,
             },
         )?;
         let q = result.q;
@@ -2819,6 +2940,9 @@ pub unsafe extern "C" fn theseus_solve_inverse_fdm(
         }
         if !out_converged.is_null() {
             *out_converged = result.converged;
+        }
+        if !out_geom_error.is_null() {
+            *out_geom_error = result.geometric_error;
         }
 
         Ok(())

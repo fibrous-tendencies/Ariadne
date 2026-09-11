@@ -36,6 +36,50 @@ pub enum LinearAlgebra {
     Iterative = 1,
 }
 
+/// Which residual the inverse solve minimises.
+///
+/// The FDM residual at a frozen target is the geometric error pre-conditioned
+/// by the Laplacian: `r(q) = E(x*)q - p = D(q)(x* - x(q))`, so
+/// `x(q) - x* = -D(q)^-1 r(q)`.  `Force` minimises `‖r‖` and therefore treats
+/// every nodal force error alike; the geometric variants minimise `‖D^-1 r‖`,
+/// which is the distance the forward solve actually lands from the target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InverseMetric {
+    /// Minimise `‖Mx - p‖`. Historical behaviour.
+    #[default]
+    Force = 0,
+    /// Minimise the geometric error with the Jacobian frozen at the target,
+    /// `E(x*)`. One weighted least-squares solve per outer iteration.
+    Geometry = 1,
+    /// Minimise the geometric error with the Jacobian re-assembled at the
+    /// current form-found geometry `x(q_k)`. True Gauss--Newton; costs no
+    /// forward solve because `x(q_k) = x* - D(q_k)^-1 r(q_k)`.
+    GeometryNewton = 2,
+}
+
+impl InverseMetric {
+    /// True when the solve is weighted by the Laplacian compliance.
+    pub fn is_geometric(self) -> bool {
+        !matches!(self, Self::Force)
+    }
+}
+
+impl TryFrom<i32> for InverseMetric {
+    type Error = TheseusError;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Force),
+            1 => Ok(Self::Geometry),
+            2 => Ok(Self::GeometryNewton),
+            other => Err(TheseusError::Solver(format!(
+                "unknown InvFDM metric {other} \
+                 (expected 0=Force, 1=Geometry, 2=GeometryNewton)"
+            ))),
+        }
+    }
+}
+
 impl TryFrom<i32> for LinearAlgebra {
     type Error = TheseusError;
 
@@ -87,6 +131,14 @@ pub struct InverseFdmOptions {
     pub upper: Vec<f64>,
     pub max_iter: usize,
     pub tol: f64,
+    /// Residual metric. `Force` reproduces the historical solve exactly.
+    pub metric: InverseMetric,
+    /// Reference force densities that seed the geometric outer loop. Empty
+    /// derives `q_e = 1 / L_e` from the target edge lengths. Ignored by
+    /// `InverseMetric::Force`.
+    pub q_ref: Vec<f64>,
+    /// Outer iteration budget for the geometric metrics.
+    pub max_outer: usize,
 }
 
 impl InverseFdmOptions {
@@ -115,9 +167,15 @@ impl InverseFdmOptions {
             upper: Vec::new(),
             max_iter: 500,
             tol: 1e-6,
+            metric: InverseMetric::Force,
+            q_ref: Vec::new(),
+            max_outer: DEFAULT_MAX_OUTER,
         }
     }
 }
+
+/// Default outer iteration budget for the geometric metrics.
+pub const DEFAULT_MAX_OUTER: usize = 8;
 
 /// Result of an inverse-FDM particular (force densities at the target).
 #[derive(Debug, Clone)]
@@ -125,6 +183,13 @@ pub struct InverseFdmResult {
     pub q: Vec<f64>,
     pub iterations: usize,
     pub converged: bool,
+    /// `‖x(q) − x*‖`, the distance the forward solve lands from the target.
+    ///
+    /// Exact for geometry-independent loads via `e = −D(q)^-1 r(q)`. Reported
+    /// for every metric, so a `Force` solve can be compared against a
+    /// geometric one on the same scale. NaN when the Laplacian at the returned
+    /// q is singular and the error could not be evaluated.
+    pub geometric_error: f64,
 }
 
 /// Result from the box-constrained spectral projected-gradient solver.

@@ -666,19 +666,55 @@ fn lsqr(
     };
     let at = a.transpose();
     let apply = |x: &[f64]| {
-        if transposed {
+        Ok(if transposed {
             at.matvec(x)
         } else {
             a.matvec(x)
-        }
+        })
     };
     let apply_t = |x: &[f64]| {
-        if transposed {
+        Ok(if transposed {
             a.matvec(x)
         } else {
             at.matvec(x)
-        }
+        })
     };
+    lsqr_operator(
+        apply,
+        apply_t,
+        rows,
+        cols,
+        rhs,
+        norm(&a.values),
+        tolerance,
+        max_iterations,
+    )
+}
+
+/// Matrix-free LSQR over an arbitrary linear operator.
+///
+/// `apply` computes `A x` and `apply_t` computes `Aᵀ y`; neither the operator
+/// nor its transpose is ever assembled. This is what lets the geometric metric
+/// use `A = S⁻¹M` — a sparse matvec followed by a triangular solve — without
+/// forming the dense product.
+///
+/// `operator_scale` is a magnitude estimate for `A` used only by the
+/// stationarity stopping test; a Frobenius norm is a fine choice.
+#[allow(clippy::too_many_arguments)]
+pub fn lsqr_operator<F, G>(
+    apply: F,
+    apply_t: G,
+    rows: usize,
+    cols: usize,
+    rhs: &[f64],
+    operator_scale: f64,
+    tolerance: f64,
+    max_iterations: usize,
+) -> Result<LsqrResult, TheseusError>
+where
+    F: Fn(&[f64]) -> Result<Vec<f64>, TheseusError>,
+    G: Fn(&[f64]) -> Result<Vec<f64>, TheseusError>,
+{
     debug_assert_eq!(rhs.len(), rows);
 
     let rhs_norm = norm(rhs);
@@ -690,7 +726,7 @@ fn lsqr(
         });
     }
     let mut u: Vec<f64> = rhs.iter().map(|v| v / rhs_norm).collect();
-    let mut v = apply_t(&u);
+    let mut v = apply_t(&u)?;
     let mut alpha = norm(&v);
     if alpha == 0.0 {
         return Ok(LsqrResult {
@@ -704,7 +740,7 @@ fn lsqr(
     let mut x = vec![0.0; cols];
     let mut phibar = rhs_norm;
     let mut rhobar = alpha;
-    let operator_norm = norm(&a.values).max(f64::EPSILON);
+    let operator_norm = operator_scale.max(f64::EPSILON);
     let iterations = if max_iterations == 0 {
         4 * (rows + cols).max(1)
     } else {
@@ -716,7 +752,7 @@ fn lsqr(
     let mut converged = false;
     let mut anorm = alpha;
     for iteration in 0..iterations {
-        let mut next_u = apply(&v);
+        let mut next_u = apply(&v)?;
         axpy(&mut next_u, -alpha, &u);
         let beta = norm(&next_u);
         if beta > 0.0 {
@@ -724,7 +760,7 @@ fn lsqr(
         }
         u = next_u;
 
-        let mut next_v = apply_t(&u);
+        let mut next_v = apply_t(&u)?;
         axpy(&mut next_v, -beta, &v);
         alpha = norm(&next_v);
         if alpha > 0.0 {

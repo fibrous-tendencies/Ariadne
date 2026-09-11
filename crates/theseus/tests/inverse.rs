@@ -4,8 +4,9 @@ use ndarray::Array2;
 use std::time::Instant;
 use theseus::fdm;
 use theseus::inverse::{
-    compose_box, solve_inverse_fdm, solve_pseudoinverse_dispatch, solve_spg_box, InverseFdmOptions,
-    LinearAlgebra, ParticularMethod,
+    compose_box, geometric_error_vector, solve_inverse_fdm, solve_pseudoinverse_dispatch,
+    solve_spg_box, InverseFdmOptions, InverseMetric, LinearAlgebra, ParticularMethod,
+    DEFAULT_MAX_OUTER,
 };
 use theseus::sparse::SparseColMatOwned;
 use theseus::types::{AnchorInfo, Bounds, FdmCache, NetworkTopology, Problem, SolverOptions};
@@ -226,6 +227,9 @@ fn inverse_opts(
         upper: Vec::new(),
         max_iter: 4_000,
         tol: 1e-8,
+        metric: InverseMetric::Force,
+        q_ref: Vec::new(),
+        max_outer: DEFAULT_MAX_OUTER,
     }
 }
 
@@ -934,5 +938,287 @@ fn benchmark_inverse_approximately_800_edges() {
                 total.as_secs_f64() * 1e3
             ),
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Geometric metric
+// ─────────────────────────────────────────────────────────────
+
+/// Nudge a target off the equilibrium manifold so it is near- but not exactly
+/// funicular.
+fn perturb(target: &Array2<f64>, amount: f64) -> Array2<f64> {
+    Array2::from_shape_fn(target.dim(), |(i, d)| {
+        let wobble = ((i * 3 + d) as f64 * 1.7).sin();
+        target[[i, d]] + amount * wobble
+    })
+}
+
+fn column_norm(v: &Array2<f64>) -> f64 {
+    v.iter().map(|x| x * x).sum::<f64>().sqrt()
+}
+
+#[test]
+fn geometric_error_identity_matches_an_independent_forward_solve() {
+    // The whole geometric metric rests on x(q) - x* = -D(q)^-1 (E(x*)q - p).
+    // Check it against a real forward solve rather than against itself.
+    let (problem, _) = arch_problem(false);
+    let q = vec![1.3, 0.7, 2.1, 0.9, 1.6, 1.1, 0.5, 2.4];
+    let (funicular, _) = forward_target(&problem, &q);
+
+    for amount in [0.0, 1e-3, 0.05, 0.4] {
+        let target = perturb(&funicular, amount);
+        let predicted = geometric_error_vector(&problem, &target, &q).unwrap();
+        let actual = Array2::from_shape_fn(funicular.dim(), |(i, d)| {
+            funicular[[i, d]] - target[[i, d]]
+        });
+
+        for i in 0..actual.nrows() {
+            for d in 0..3 {
+                assert!(
+                    (predicted[[i, d]] - actual[[i, d]]).abs() < 1e-9,
+                    "identity failed at node {i} axis {d} for perturbation {amount}: \
+                     predicted {} vs forward-solved {}",
+                    predicted[[i, d]],
+                    actual[[i, d]]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn geometric_error_is_zero_when_the_target_is_already_funicular() {
+    let (problem, _) = arch_problem(false);
+    let q = vec![1.0, 1.4, 0.8, 1.2, 0.6, 1.9, 1.1, 0.7];
+    let (funicular, _) = forward_target(&problem, &q);
+
+    let error = geometric_error_vector(&problem, &funicular, &q).unwrap();
+    assert!(
+        column_norm(&error) < 1e-10,
+        "expected a funicular target to have zero geometric error, got {}",
+        column_norm(&error)
+    );
+}
+
+fn geometric_opts(
+    metric: InverseMetric,
+    particular: ParticularMethod,
+    algebra: LinearAlgebra,
+    lambda: f64,
+) -> InverseFdmOptions {
+    InverseFdmOptions {
+        metric,
+        // A positive box keeps the Laplacian SPD, which the compliance needs.
+        signs: vec![1],
+        lower: vec![1e-6],
+        max_outer: 12,
+        tol: 1e-10,
+        ..inverse_opts(lambda, true, particular, algebra, true)
+    }
+}
+
+/// Distance from the forward solve to the target for a recovered q.
+fn achieved_error(problem: &Problem, target: &Array2<f64>, q: &[f64]) -> f64 {
+    let (reached, _) = forward_target(problem, q);
+    let mut sum = 0.0;
+    for i in 0..target.nrows() {
+        for d in 0..3 {
+            let diff = reached[[i, d]] - target[[i, d]];
+            sum += diff * diff;
+        }
+    }
+    sum.sqrt()
+}
+
+#[test]
+fn geometric_metric_lands_closer_to_a_near_funicular_target_than_the_force_metric() {
+    let (problem, _) = arch_problem(false);
+    let q = vec![1.2, 0.9, 1.5, 1.1, 0.8, 1.3, 0.6, 1.7];
+    let (funicular, _) = forward_target(&problem, &q);
+    let target = perturb(&funicular, 0.02);
+
+    let force = solve_inverse_fdm(
+        &problem,
+        &target,
+        geometric_opts(
+            InverseMetric::Force,
+            ParticularMethod::Clarabel,
+            LinearAlgebra::Direct,
+            1e-8,
+        ),
+    )
+    .unwrap();
+    let geometry = solve_inverse_fdm(
+        &problem,
+        &target,
+        geometric_opts(
+            InverseMetric::Geometry,
+            ParticularMethod::Clarabel,
+            LinearAlgebra::Direct,
+            1e-8,
+        ),
+    )
+    .unwrap();
+    let newton = solve_inverse_fdm(
+        &problem,
+        &target,
+        geometric_opts(
+            InverseMetric::GeometryNewton,
+            ParticularMethod::Clarabel,
+            LinearAlgebra::Direct,
+            1e-8,
+        ),
+    )
+    .unwrap();
+
+    let force_error = achieved_error(&problem, &target, &force.q);
+    let geometry_error = achieved_error(&problem, &target, &geometry.q);
+    let newton_error = achieved_error(&problem, &target, &newton.q);
+
+    eprintln!(
+        "force={force_error:.6e} geometry={geometry_error:.6e} newton={newton_error:.6e}"
+    );
+    assert!(
+        geometry_error < force_error,
+        "geometric metric ({geometry_error:.6e}) should beat the force metric \
+         ({force_error:.6e})"
+    );
+    assert!(
+        newton_error <= geometry_error * 1.05,
+        "Gauss-Newton ({newton_error:.6e}) should not be worse than the frozen-target \
+         metric ({geometry_error:.6e})"
+    );
+}
+
+#[test]
+fn reported_geometric_error_matches_the_forward_solve() {
+    let (problem, _) = arch_problem(false);
+    let q = vec![1.1, 1.4, 0.9, 1.2, 1.0, 1.5, 0.7, 1.3];
+    let (funicular, _) = forward_target(&problem, &q);
+    let target = perturb(&funicular, 0.03);
+
+    let result = solve_inverse_fdm(
+        &problem,
+        &target,
+        geometric_opts(
+            InverseMetric::GeometryNewton,
+            ParticularMethod::Clarabel,
+            LinearAlgebra::Direct,
+            1e-8,
+        ),
+    )
+    .unwrap();
+
+    let measured = achieved_error(&problem, &target, &result.q);
+    assert!(
+        (result.geometric_error - measured).abs() < 1e-7,
+        "reported geometric error {} disagrees with the forward solve {measured}",
+        result.geometric_error
+    );
+}
+
+#[test]
+fn geometric_backends_agree_on_the_same_weighted_problem() {
+    let (problem, _) = arch_problem(false);
+    let q = vec![1.0, 1.2, 0.9, 1.1, 1.3, 0.8, 1.4, 1.0];
+    let (funicular, _) = forward_target(&problem, &q);
+    let target = perturb(&funicular, 0.02);
+
+    let cases = [
+        ("clarabel", ParticularMethod::Clarabel, LinearAlgebra::Direct),
+        ("saddle", ParticularMethod::Augmented, LinearAlgebra::Direct),
+        ("spg", ParticularMethod::Clarabel, LinearAlgebra::Iterative),
+    ];
+
+    let mut errors = Vec::new();
+    for (name, particular, algebra) in cases {
+        let result = solve_inverse_fdm(
+            &problem,
+            &target,
+            geometric_opts(InverseMetric::Geometry, particular, algebra, 1e-8),
+        )
+        .unwrap_or_else(|e| panic!("{name} failed: {e}"));
+        let error = achieved_error(&problem, &target, &result.q);
+        eprintln!("{name}: geometric error {error:.6e}");
+        errors.push((name, error));
+    }
+
+    let best = errors.iter().map(|(_, e)| *e).fold(f64::MAX, f64::min);
+    for (name, error) in &errors {
+        assert!(
+            *error <= best * 10.0 + 1e-9,
+            "{name} reached {error:.6e}, far off the best backend {best:.6e}"
+        );
+    }
+}
+
+#[test]
+fn geometric_metric_rejects_gram_and_sparse_qr() {
+    let (problem, _) = arch_problem(false);
+    let q = vec![1.0; 8];
+    let (funicular, _) = forward_target(&problem, &q);
+
+    for particular in [ParticularMethod::Gram, ParticularMethod::SparseQr] {
+        let error = solve_inverse_fdm(
+            &problem,
+            &funicular,
+            InverseFdmOptions {
+                metric: InverseMetric::Geometry,
+                max_outer: 4,
+                ..inverse_opts(1e-8, true, particular, LinearAlgebra::Direct, true)
+            },
+        )
+        .expect_err("expected the geometric metric to reject a densifying backend");
+        let message = error.to_string();
+        assert!(
+            message.contains("Gram or sparse QR"),
+            "unexpected rejection message for {particular:?}: {message}"
+        );
+    }
+}
+
+#[test]
+fn geometric_metric_rejects_l1() {
+    let (problem, _) = arch_problem(false);
+    let q = vec![1.0; 8];
+    let (funicular, _) = forward_target(&problem, &q);
+
+    let error = solve_inverse_fdm(
+        &problem,
+        &funicular,
+        InverseFdmOptions {
+            metric: InverseMetric::Geometry,
+            max_outer: 4,
+            ..inverse_opts(1e-8, false, ParticularMethod::Clarabel, LinearAlgebra::Direct, true)
+        },
+    )
+    .expect_err("expected the geometric metric to reject IRLS");
+    assert!(
+        error.to_string().contains("L1/IRLS"),
+        "unexpected rejection message: {error}"
+    );
+}
+
+#[test]
+fn force_metric_is_unchanged_by_the_metric_plumbing() {
+    // Same fixture and options as the historical path; only the new default
+    // fields are present. The recovered q must still round-trip exactly.
+    let (problem, _) = triangle_problem();
+    let expected = vec![2.0, 3.0];
+    let (target, _) = forward_target(&problem, &expected);
+
+    let result = solve_inverse_fdm(
+        &problem,
+        &target,
+        inverse_opts(0.0, true, ParticularMethod::Augmented, LinearAlgebra::Direct, true),
+    )
+    .unwrap();
+
+    for (got, want) in result.q.iter().zip(&expected) {
+        assert!(
+            (got - want).abs() < 1e-8,
+            "force metric changed: got {got}, expected {want}"
+        );
     }
 }
