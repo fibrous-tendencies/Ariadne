@@ -1,34 +1,155 @@
 //! Inverse FDM solvers: find force densities q from a target geometry.
 //!
-//! Given target free-node positions, the FDM equilibrium per dimension d is:
-//!
-//!   Cn^T  diag(u_d)  q  =  Pn_d
-//!
-//! where u_d = C · N_target are the target member coordinate differences.
-//! Stacking all 3 dimensions gives the sparse system  M q = p.
-//!
-//! When `solve_for_q` is false, the system is reformulated to solve for axial
-//! forces F directly by normalising u to unit vectors:
-//!
-//!   Cn^T  diag(e_d)  F  =  Pn_d       where  e_d = u_d / ‖u‖
-//!
-//! Force densities are then recovered as  q = F / L.
-//!
-//! Three solvers are provided:
-//!
-//!   - **Pseudoinverse L2** (Tikhonov-regularised normal equations):
-//!       min ‖Mq − p‖²  (+λ‖q‖²)   →  single sparse LDL via `sprs-ldl`
-//!
-//!   - **Pseudoinverse L1** (iteratively reweighted least squares):
-//!       min ‖Mq − p‖₁  (+λ‖q‖²)   →  IRLS: repeated weighted L2 solves
-//!       More robust than L2 when a few equilibrium equations are outliers.
-//!
-//!   - **NNLS** (spectral projected gradient):
-//!       min ‖Mq − p‖²  s.t. q ≥ 0   →  sparse matvecs only
+//! Direct unconstrained particulars use Gram, the saddle (Moore--Penrose /
+//! Tikhonov), or sparse QR. Iterative unconstrained uses LSQR. A finite box
+//! (signs and/or bounds) uses Clarabel (Direct) or spectral projected
+//! gradient (Iterative). `L2 = false` wraps any inner in IRLS.
 
+use crate::nullspace::{
+    apply_pseudoinverse, solve_lsqr, solve_saddle_pseudoinverse, EquilibriumSystem,
+    EquilibriumUnknown,
+};
 use crate::sparse::SparseColMatOwned;
 use crate::types::{Factorization, FactorizationStrategy, Problem, TheseusError};
+use dyn_stack::{GlobalPodBuffer, PodStack};
+use faer_core::{Conj, Mat, Parallelism};
+use faer_sparse::qr::{factorize_symbolic_qr, QrSymbolicParams, SymbolicQr};
 use ndarray::Array2;
+
+/// InvFDM particular-solution backend selected by the Grasshopper menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParticularMethod {
+    /// Gram normal equations `(MᵀM + λI)q = Mᵀp`. λ = 0 is unregularized.
+    Gram = 0,
+    /// Augmented saddle / Moore–Penrose / Tikhonov.
+    Augmented = 1,
+    /// Tall full-column-rank sparse QR least squares (comparison path).
+    SparseQr = 2,
+    /// Clarabel quadratic programming, including unconstrained Direct solves.
+    Clarabel = 3,
+}
+
+/// Direct factorization versus iterative matvec linear algebra.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinearAlgebra {
+    Direct = 0,
+    Iterative = 1,
+}
+
+impl TryFrom<i32> for LinearAlgebra {
+    type Error = TheseusError;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Direct),
+            1 => Ok(Self::Iterative),
+            other => Err(TheseusError::Solver(format!(
+                "unknown InvFDM linear algebra {other} (expected 0=Direct, 1=Iterative)"
+            ))),
+        }
+    }
+}
+
+/// Per-edge box on the inverse unknown (q or t).
+#[derive(Debug, Clone)]
+pub struct BoxBounds {
+    pub lower: Vec<f64>,
+    pub upper: Vec<f64>,
+}
+
+impl BoxBounds {
+    pub fn unconstrained(n: usize) -> Self {
+        Self {
+            lower: vec![f64::NEG_INFINITY; n],
+            upper: vec![f64::INFINITY; n],
+        }
+    }
+
+    pub fn has_finite(&self) -> bool {
+        self.lower.iter().any(|v| v.is_finite()) || self.upper.iter().any(|v| v.is_finite())
+    }
+}
+
+/// Options for [`solve_inverse_fdm`].
+#[derive(Debug, Clone)]
+pub struct InverseFdmOptions {
+    pub regularization: f64,
+    pub use_l2: bool,
+    pub max_l1_iter: usize,
+    pub particular_method: ParticularMethod,
+    pub linear_algebra: LinearAlgebra,
+    pub enforce_zero_rx: bool,
+    pub enforce_zero_ry: bool,
+    pub enforce_zero_rz: bool,
+    pub solve_for_q: bool,
+    pub signs: Vec<i32>,
+    pub lower: Vec<f64>,
+    pub upper: Vec<f64>,
+    pub max_iter: usize,
+    pub tol: f64,
+}
+
+impl InverseFdmOptions {
+    pub fn direct_unconstrained(
+        regularization: f64,
+        use_l2: bool,
+        max_l1_iter: usize,
+        particular_method: ParticularMethod,
+        enforce_zero_rx: bool,
+        enforce_zero_ry: bool,
+        enforce_zero_rz: bool,
+        solve_for_q: bool,
+    ) -> Self {
+        Self {
+            regularization,
+            use_l2,
+            max_l1_iter,
+            particular_method,
+            linear_algebra: LinearAlgebra::Direct,
+            enforce_zero_rx,
+            enforce_zero_ry,
+            enforce_zero_rz,
+            solve_for_q,
+            signs: Vec::new(),
+            lower: Vec::new(),
+            upper: Vec::new(),
+            max_iter: 500,
+            tol: 1e-6,
+        }
+    }
+}
+
+/// Result of an inverse-FDM particular (force densities at the target).
+#[derive(Debug, Clone)]
+pub struct InverseFdmResult {
+    pub q: Vec<f64>,
+    pub iterations: usize,
+    pub converged: bool,
+}
+
+/// Result from the box-constrained spectral projected-gradient solver.
+pub struct SpgBoxResult {
+    pub q: Vec<f64>,
+    pub iterations: usize,
+    pub converged: bool,
+}
+
+impl TryFrom<i32> for ParticularMethod {
+    type Error = TheseusError;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Gram),
+            1 => Ok(Self::Augmented),
+            2 => Ok(Self::SparseQr),
+            3 => Ok(Self::Clarabel),
+            other => Err(TheseusError::Solver(format!(
+                "unknown InvFDM particular method {other} \
+                 (expected 0=Gram, 1=Augmented, 2=SparseQr, 3=Clarabel)"
+            ))),
+        }
+    }
+}
 
 /// Factorise with LDL and solve a single RHS using ephemeral workspace.
 fn ldl_solve(g: &SparseColMatOwned, rhs: &[f64]) -> Result<Vec<f64>, TheseusError> {
@@ -39,78 +160,19 @@ fn ldl_solve(g: &SparseColMatOwned, rhs: &[f64]) -> Result<Vec<f64>, TheseusErro
     fac.solve(rhs, &mut workspace, &mut solve_stack)
 }
 
-// ─────────────────────────────────────────────────────────────
-//  Target member vectors
-// ─────────────────────────────────────────────────────────────
-
-/// Compute target member coordinate differences from full node positions.
-///
-/// Returns `u` (ne × 3) where `u[k,:] = N_target[end_k] − N_target[start_k]`.
-fn compute_target_member_vectors(problem: &Problem, target_free_xyz: &Array2<f64>) -> Array2<f64> {
-    let topo = &problem.topology;
-    let ne = topo.num_edges;
-    let nn = topo.num_nodes;
-
-    // Build full node position array: free nodes from target, fixed from problem
-    let mut nf = Array2::<f64>::zeros((nn, 3));
-
-    for (i, &node) in topo.free_node_indices.iter().enumerate() {
-        for d in 0..3 {
-            nf[[node, d]] = target_free_xyz[[i, d]];
-        }
+/// Gram LDL solve. At λ = 0 a singular MᵀM is reported as such.
+fn gram_ldl_solve(
+    g: &SparseColMatOwned,
+    rhs: &[f64],
+    regularization: f64,
+) -> Result<Vec<f64>, TheseusError> {
+    match ldl_solve(g, rhs) {
+        Ok(sol) => Ok(sol),
+        Err(_) if regularization == 0.0 => Err(TheseusError::Solver(
+            "Gram at λ=0: MᵀM is singular".into(),
+        )),
+        Err(error) => Err(error),
     }
-    for (i, &node) in topo.fixed_node_indices.iter().enumerate() {
-        for d in 0..3 {
-            nf[[node, d]] = problem.fixed_node_positions[[i, d]];
-        }
-    }
-
-    // u = C * N  via incidence (CSC)
-    let inc = &topo.incidence;
-    let mut u = Array2::<f64>::zeros((ne, 3));
-    for col in 0..nn {
-        let start = inc.col_ptrs[col] as usize;
-        let end_ = inc.col_ptrs[col + 1] as usize;
-        for nz in start..end_ {
-            let row = inc.row_indices[nz] as usize;
-            let val = inc.values[nz];
-            for d in 0..3 {
-                u[[row, d]] += val * nf[[col, d]];
-            }
-        }
-    }
-    u
-}
-
-// ─────────────────────────────────────────────────────────────
-//  Normalise u → unit vectors (for solve-for-F mode)
-// ─────────────────────────────────────────────────────────────
-
-const ZERO_LENGTH_TOL: f64 = 1e-14;
-
-/// Normalise member vectors in-place to unit vectors and return the edge lengths.
-///
-/// Each row `u[k,:]` is divided by its Euclidean norm `L_k`.  Returns `L`
-/// (length `ne`).  Errors if any edge has near-zero length.
-fn normalise_member_vectors(u: &mut Array2<f64>) -> Result<Vec<f64>, TheseusError> {
-    let ne = u.nrows();
-    let mut lengths = vec![0.0; ne];
-    for k in 0..ne {
-        let lsq = u[[k, 0]] * u[[k, 0]] + u[[k, 1]] * u[[k, 1]] + u[[k, 2]] * u[[k, 2]];
-        let l = lsq.sqrt();
-        if l < ZERO_LENGTH_TOL {
-            return Err(TheseusError::Solver(format!(
-                "target edge {k} has near-zero length ({l:.2e}); \
-                 cannot solve for F with degenerate edges",
-            )));
-        }
-        let inv_l = 1.0 / l;
-        u[[k, 0]] *= inv_l;
-        u[[k, 1]] *= inv_l;
-        u[[k, 2]] *= inv_l;
-        lengths[k] = l;
-    }
-    Ok(lengths)
 }
 
 /// Convert axial forces F back to force densities: `q[k] = F[k] / L[k]`.
@@ -119,101 +181,6 @@ fn forces_to_q(f: &[f64], lengths: &[f64]) -> Vec<f64> {
         .zip(lengths.iter())
         .map(|(&fi, &li)| fi / li)
         .collect()
-}
-
-// ─────────────────────────────────────────────────────────────
-//  Build sparse equilibrium matrix  M  (3·nn_free × ne)
-// ─────────────────────────────────────────────────────────────
-
-/// Build the sparse matrix M by vertically stacking Cn^T · diag(u_d) for d=x,y,z.
-///
-/// When any `enforce_zero_r{x,y,z}` flag is true and there are fixed nodes,
-/// appends Cf^T · diag(u_d) rows and zeros to the RHS for each enabled
-/// dimension d to strictly enforce R_d = 0 at supports.
-///
-/// M has the same column-sparsity as Cn^T (at most 2 non-zeros per column per
-/// dimension block → ≤ 6 per column total).  Uses COO → CSC for construction.
-fn build_equilibrium_matrix(
-    problem: &Problem,
-    u: &Array2<f64>,
-    enforce_zero_rx: bool,
-    enforce_zero_ry: bool,
-    enforce_zero_rz: bool,
-) -> (SparseColMatOwned, Vec<f64>) {
-    let topo = &problem.topology;
-    let ne = topo.num_edges;
-    let nn_free = topo.free_node_indices.len();
-    let nn_fixed = topo.fixed_node_indices.len();
-
-    let mut enforce_dims: Vec<usize> = Vec::new();
-    if enforce_zero_rx && nn_fixed > 0 {
-        enforce_dims.push(0);
-    }
-    if enforce_zero_ry && nn_fixed > 0 {
-        enforce_dims.push(1);
-    }
-    if enforce_zero_rz && nn_fixed > 0 {
-        enforce_dims.push(2);
-    }
-    let extra_rows = enforce_dims.len() * nn_fixed;
-    let m_rows = 3 * nn_free + extra_rows;
-
-    // Cn is (ne × nn_free).  Cn^T is (nn_free × ne).
-    let cn_t = topo.free_incidence.transpose();
-
-    let mut triplets: Vec<(u32, u32, f64)> = Vec::new();
-    for d in 0..3usize {
-        let row_offset = d * nn_free;
-        for col in 0..ne {
-            let scale = u[[col, d]];
-            if scale == 0.0 {
-                continue;
-            }
-            let start = cn_t.col_ptrs[col] as usize;
-            let end_ = cn_t.col_ptrs[col + 1] as usize;
-            for nz in start..end_ {
-                let row = cn_t.row_indices[nz] as usize;
-                let val = cn_t.values[nz];
-                triplets.push(((row_offset + row) as u32, col as u32, val * scale));
-            }
-        }
-    }
-
-    // Cf^T · diag(u_d): append rows for R_d = 0 at fixed nodes
-    if !enforce_dims.is_empty() {
-        let cf = &topo.fixed_incidence; // ne × nn_fixed
-        let mut row_offset = 3 * nn_free;
-        for &d in &enforce_dims {
-            for j in 0..nn_fixed {
-                let start = cf.col_ptrs[j] as usize;
-                let end_ = cf.col_ptrs[j + 1] as usize;
-                for nz in start..end_ {
-                    let i = cf.row_indices[nz] as usize;
-                    let val = cf.values[nz];
-                    let scale = u[[i, d]];
-                    if scale != 0.0 {
-                        triplets.push(((row_offset + j) as u32, i as u32, val * scale));
-                    }
-                }
-            }
-            row_offset += nn_fixed;
-        }
-    }
-
-    let m_mat =
-        SparseColMatOwned::from_triplets(m_rows, ne, &triplets).expect("build_equilibrium_matrix");
-
-    // p = [Pn_x; Pn_y; Pn_z; 0; ...; 0]  (zeros for reaction rows)
-    let loads = &problem.free_node_loads;
-    let mut p = vec![0.0; m_rows];
-    for d in 0..3 {
-        let off = d * nn_free;
-        for i in 0..nn_free {
-            p[off + i] = loads[[i, d]];
-        }
-    }
-
-    (m_mat, p)
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -277,64 +244,6 @@ fn build_augmented_system(
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Implicit matvecs  (for NNLS — avoids forming M)
-// ─────────────────────────────────────────────────────────────
-
-/// Compute r = M·q  without forming M.
-///
-/// r_d = Cn^T · (u_d ⊙ q)  for each dimension d, concatenated.
-fn apply_m(cn_t: &SparseColMatOwned, u: &Array2<f64>, q: &[f64], nn_free: usize) -> Vec<f64> {
-    let ne = q.len();
-    let mut r = vec![0.0; 3 * nn_free];
-
-    for d in 0..3usize {
-        let off = d * nn_free;
-        for col in 0..ne {
-            let w = u[[col, d]] * q[col];
-            if w == 0.0 {
-                continue;
-            }
-            let start = cn_t.col_ptrs[col] as usize;
-            let end_ = cn_t.col_ptrs[col + 1] as usize;
-            for nz in start..end_ {
-                let row = cn_t.row_indices[nz] as usize;
-                let val = cn_t.values[nz];
-                r[off + row] += val * w;
-            }
-        }
-    }
-    r
-}
-
-/// Compute g = M^T · r  without forming M.
-///
-/// g_k = Σ_d  u[k,d] · (Cn · r_d)[k]
-fn apply_mt(cn: &SparseColMatOwned, u: &Array2<f64>, r: &[f64], nn_free: usize) -> Vec<f64> {
-    let ne = u.nrows();
-    let mut g = vec![0.0; ne];
-
-    for d in 0..3usize {
-        let off = d * nn_free;
-        let r_d = &r[off..off + nn_free];
-
-        for col in 0..nn_free {
-            let rd_val = r_d[col];
-            if rd_val == 0.0 {
-                continue;
-            }
-            let start = cn.col_ptrs[col] as usize;
-            let end_ = cn.col_ptrs[col + 1] as usize;
-            for nz in start..end_ {
-                let row = cn.row_indices[nz] as usize;
-                let val = cn.values[nz];
-                g[row] += u[[row, d]] * val * rd_val;
-            }
-        }
-    }
-    g
-}
-
-// ─────────────────────────────────────────────────────────────
 //  Pseudoinverse  (Tikhonov-regularised sparse normal equations)
 // ─────────────────────────────────────────────────────────────
 
@@ -353,20 +262,20 @@ pub fn solve_pseudoinverse(
     solve_for_q: bool,
 ) -> Result<Vec<f64>, TheseusError> {
     let ne = problem.topology.num_edges;
-
-    let mut u = compute_target_member_vectors(problem, target_free_xyz);
-    let target_lengths = if solve_for_q {
-        None
-    } else {
-        Some(normalise_member_vectors(&mut u)?)
-    };
-    let (m_mat, p) = build_equilibrium_matrix(
+    let system = EquilibriumSystem::assemble(
         problem,
-        &u,
+        target_free_xyz,
+        if solve_for_q {
+            EquilibriumUnknown::ForceDensity
+        } else {
+            EquilibriumUnknown::Force
+        },
         enforce_zero_rx,
         enforce_zero_ry,
         enforce_zero_rz,
-    );
+    )?;
+    let m_mat = system.a;
+    let p = system.p;
 
     // G = M^T M  (ne × ne, sparse)
     let m_t = m_mat.transpose();
@@ -382,11 +291,12 @@ pub fn solve_pseudoinverse(
     let h = m_t.matvec(&p);
 
     // Factorise G and solve (LDL for normal equations)
-    let sol = ldl_solve(&g, &h)?;
+    let sol = gram_ldl_solve(&g, &h, regularization)?;
 
-    let q = match target_lengths {
-        Some(ref lengths) => forces_to_q(&sol, lengths),
-        None => sol,
+    let q = if solve_for_q {
+        sol
+    } else {
+        forces_to_q(&sol, &system.lengths)
     };
 
     // Validate solution
@@ -422,7 +332,8 @@ pub fn solve_pseudoinverse(
 ///   [ M^T  -λI] [q] = [0]
 ///
 /// Asymptotically faster for large meshes (>50k edges) where the M^T M
-/// fill-in explosion dominates runtime.  Requires `λ > 0`.
+/// fill-in explosion dominates runtime. At `λ = 0`, Direct MP is an LDL-only
+/// solve and reports a singular saddle instead of silently falling back.
 /// When `solve_for_q` is false, solves for axial forces F instead and
 /// recovers q = F / L from the target edge lengths.
 pub fn solve_pseudoinverse_augmented(
@@ -434,37 +345,40 @@ pub fn solve_pseudoinverse_augmented(
     enforce_zero_rz: bool,
     solve_for_q: bool,
 ) -> Result<Vec<f64>, TheseusError> {
-    if regularization <= 0.0 {
+    if regularization < 0.0 {
         return Err(TheseusError::Solver(
-            "augmented system requires regularization > 0".into(),
+            "regularization must be non-negative".into(),
         ));
     }
 
     let ne = problem.topology.num_edges;
-
-    let mut u = compute_target_member_vectors(problem, target_free_xyz);
-    let target_lengths = if solve_for_q {
-        None
-    } else {
-        Some(normalise_member_vectors(&mut u)?)
-    };
-    let (m_mat, p) = build_equilibrium_matrix(
+    let system = EquilibriumSystem::assemble(
         problem,
-        &u,
+        target_free_xyz,
+        if solve_for_q {
+            EquilibriumUnknown::ForceDensity
+        } else {
+            EquilibriumUnknown::Force
+        },
         enforce_zero_rx,
         enforce_zero_ry,
         enforce_zero_rz,
-    );
+    )?;
+    let m_mat = system.a;
+    let p = system.p;
     let m_rows = p.len();
 
-    let (k_mat, rhs) = build_augmented_system(&m_mat, &p, regularization);
-
-    let sol = ldl_solve(&k_mat, &rhs)?;
-
-    let raw: Vec<f64> = sol[m_rows..m_rows + ne].to_vec();
-    let q = match target_lengths {
-        Some(ref lengths) => forces_to_q(&raw, lengths),
-        None => raw,
+    let raw = if regularization == 0.0 {
+        solve_saddle_pseudoinverse(&m_mat, &p, 0.0, 1e-11, 0)?
+    } else {
+        let (k_mat, rhs) = build_augmented_system(&m_mat, &p, regularization);
+        let sol = ldl_solve(&k_mat, &rhs)?;
+        sol[m_rows..m_rows + ne].to_vec()
+    };
+    let q = if solve_for_q {
+        raw
+    } else {
+        forces_to_q(&raw, &system.lengths)
     };
 
     for (i, &v) in q.iter().enumerate() {
@@ -510,20 +424,20 @@ pub fn solve_pseudoinverse_l1(
     solve_for_q: bool,
 ) -> Result<Vec<f64>, TheseusError> {
     let ne = problem.topology.num_edges;
-
-    let mut u = compute_target_member_vectors(problem, target_free_xyz);
-    let target_lengths = if solve_for_q {
-        None
-    } else {
-        Some(normalise_member_vectors(&mut u)?)
-    };
-    let (m_mat, p) = build_equilibrium_matrix(
+    let system = EquilibriumSystem::assemble(
         problem,
-        &u,
+        target_free_xyz,
+        if solve_for_q {
+            EquilibriumUnknown::ForceDensity
+        } else {
+            EquilibriumUnknown::Force
+        },
         enforce_zero_rx,
         enforce_zero_ry,
         enforce_zero_rz,
-    );
+    )?;
+    let m_mat = system.a;
+    let p = system.p;
 
     let m_t = m_mat.transpose();
     let m_rows = p.len();
@@ -535,7 +449,7 @@ pub fn solve_pseudoinverse_l1(
         g_l2.add_diagonal(regularization);
     }
     let h_l2 = m_t.matvec(&p);
-    let mut sol = ldl_solve(&g_l2, &h_l2)?;
+    let mut sol = gram_ldl_solve(&g_l2, &h_l2, regularization)?;
 
     const ABS_EPS: f64 = 1e-12;
     let mut prev_l1 = f64::MAX;
@@ -598,12 +512,13 @@ pub fn solve_pseudoinverse_l1(
         }
         let h = m_t.matvec(&wp);
 
-        sol = ldl_solve(&g, &h)?;
+        sol = gram_ldl_solve(&g, &h, effective_reg)?;
     }
 
-    let q = match target_lengths {
-        Some(ref lengths) => forces_to_q(&sol, lengths),
-        None => sol,
+    let q = if solve_for_q {
+        sol
+    } else {
+        forces_to_q(&sol, &system.lengths)
     };
 
     // Validate solution
@@ -632,8 +547,8 @@ pub fn solve_pseudoinverse_l1(
 /// Find force densities via L1-minimisation using the augmented saddle-point system.
 ///
 /// Equivalent to `solve_pseudoinverse_l1` but each IRLS iteration factorises
-/// the augmented system instead of forming M_w^T M_w.  Avoids fill-in explosion
-/// at large scales.  Requires `λ > 0`.
+/// the augmented system instead of forming M_w^T M_w. Avoids fill-in explosion
+/// at large scales; zero regularization uses the Moore--Penrose LSQR fallback.
 /// When `solve_for_q` is false, solves for axial forces F instead and
 /// recovers q = F / L from the target edge lengths.
 pub fn solve_pseudoinverse_l1_augmented(
@@ -646,34 +561,38 @@ pub fn solve_pseudoinverse_l1_augmented(
     enforce_zero_rz: bool,
     solve_for_q: bool,
 ) -> Result<Vec<f64>, TheseusError> {
-    if regularization <= 0.0 {
+    if regularization < 0.0 {
         return Err(TheseusError::Solver(
-            "augmented system requires regularization > 0".into(),
+            "regularization must be non-negative".into(),
         ));
     }
 
     let ne = problem.topology.num_edges;
-
-    let mut u = compute_target_member_vectors(problem, target_free_xyz);
-    let target_lengths = if solve_for_q {
-        None
-    } else {
-        Some(normalise_member_vectors(&mut u)?)
-    };
-    let (m_mat, p) = build_equilibrium_matrix(
+    let system = EquilibriumSystem::assemble(
         problem,
-        &u,
+        target_free_xyz,
+        if solve_for_q {
+            EquilibriumUnknown::ForceDensity
+        } else {
+            EquilibriumUnknown::Force
+        },
         enforce_zero_rx,
         enforce_zero_ry,
         enforce_zero_rz,
-    );
+    )?;
+    let m_mat = system.a;
+    let p = system.p;
 
     let m_rows = p.len();
 
     // Warm-start: L2 solution via augmented system
-    let (k_l2, rhs_l2) = build_augmented_system(&m_mat, &p, regularization);
-    let sol_l2 = ldl_solve(&k_l2, &rhs_l2)?;
-    let mut sol: Vec<f64> = sol_l2[m_rows..m_rows + ne].to_vec();
+    let mut sol = if regularization == 0.0 {
+        apply_pseudoinverse(&m_mat, &p, 1e-11, 0)?
+    } else {
+        let (k_l2, rhs_l2) = build_augmented_system(&m_mat, &p, regularization);
+        let sol_l2 = ldl_solve(&k_l2, &rhs_l2)?;
+        sol_l2[m_rows..m_rows + ne].to_vec()
+    };
 
     const ABS_EPS: f64 = 1e-12;
     let mut prev_l1 = f64::MAX;
@@ -726,13 +645,18 @@ pub fn solve_pseudoinverse_l1_augmented(
 
         let (k_mat, rhs) = build_augmented_system(&m_w, &rhs_top, effective_reg);
 
-        let iter_sol = ldl_solve(&k_mat, &rhs)?;
-        sol = iter_sol[m_rows..m_rows + ne].to_vec();
+        if effective_reg == 0.0 {
+            sol = apply_pseudoinverse(&m_w, &rhs_top, 1e-11, 0)?;
+        } else {
+            let iter_sol = ldl_solve(&k_mat, &rhs)?;
+            sol = iter_sol[m_rows..m_rows + ne].to_vec();
+        }
     }
 
-    let q = match target_lengths {
-        Some(ref lengths) => forces_to_q(&sol, lengths),
-        None => sol,
+    let q = if solve_for_q {
+        sol
+    } else {
+        forces_to_q(&sol, &system.lengths)
     };
 
     for (i, &v) in q.iter().enumerate() {
@@ -757,197 +681,92 @@ pub fn solve_pseudoinverse_l1_augmented(
 //  Pseudoinverse dispatcher
 // ─────────────────────────────────────────────────────────────
 
-/// Dispatch to L2 or L1 pseudoinverse, with normal-equations or augmented system.
+/// Sparse QR least-squares particular for tall full-column-rank systems.
 ///
-/// The augmented path avoids forming M^T M and is faster for large meshes
-/// (>50k edges).  It requires `regularization > 0`.
-///
-/// When `enforce_zero_r{x,y,z}` flags are true, augments the system to
-/// strictly enforce R_d = 0 at fixed supports for the corresponding
-/// dimension(s).
-///
-/// When `solve_for_q` is false, solves for axial forces F directly (using
-/// unit direction vectors instead of coordinate differences) and recovers
-/// q = F / L from the target edge lengths.
+/// Uses COLAMD symbolic ordering and validates rank from sparse `R` pivots.
+/// Rank-deficient or wide systems return a precise unsupported error.
+pub fn solve_pseudoinverse_qr(
+    problem: &Problem,
+    target_free_xyz: &Array2<f64>,
+    enforce_zero_rx: bool,
+    enforce_zero_ry: bool,
+    enforce_zero_rz: bool,
+    solve_for_q: bool,
+) -> Result<Vec<f64>, TheseusError> {
+    let ne = problem.topology.num_edges;
+    let system = EquilibriumSystem::assemble(
+        problem,
+        target_free_xyz,
+        if solve_for_q {
+            EquilibriumUnknown::ForceDensity
+        } else {
+            EquilibriumUnknown::Force
+        },
+        enforce_zero_rx,
+        enforce_zero_ry,
+        enforce_zero_rz,
+    )?;
+    let a = &system.a;
+    if a.nrows < a.ncols {
+        return Err(TheseusError::Solver(format!(
+            "sparse QR particular requires rows >= columns ({} < {})",
+            a.nrows, a.ncols
+        )));
+    }
+
+    let mut symbolic = None;
+    let sol = solve_qr_on(a, &system.p, true, &mut symbolic)?;
+    let q = if solve_for_q {
+        sol
+    } else {
+        forces_to_q(&sol, &system.lengths)
+    };
+
+    for (i, &v) in q.iter().enumerate() {
+        if !v.is_finite() {
+            return Err(TheseusError::Solver(format!(
+                "pseudoinverse (sparse QR) produced non-finite q at edge {i}"
+            )));
+        }
+    }
+    if q.len() != ne {
+        return Err(TheseusError::Shape(format!(
+            "pseudoinverse (sparse QR) returned {} q values, expected {ne}",
+            q.len()
+        )));
+    }
+    Ok(q)
+}
+
+/// Dispatch to an inverse-FDM particular. Unconstrained Direct keeps the
+/// historical Gram / saddle / QR arguments.
 pub fn solve_pseudoinverse_dispatch(
     problem: &Problem,
     target_free_xyz: &Array2<f64>,
     regularization: f64,
     use_l2: bool,
     max_l1_iter: usize,
-    use_augmented: bool,
+    particular_method: ParticularMethod,
     enforce_zero_rx: bool,
     enforce_zero_ry: bool,
     enforce_zero_rz: bool,
     solve_for_q: bool,
 ) -> Result<Vec<f64>, TheseusError> {
-    match (use_l2, use_augmented) {
-        (true, false) => solve_pseudoinverse(
-            problem,
-            target_free_xyz,
+    solve_inverse_fdm(
+        problem,
+        target_free_xyz,
+        InverseFdmOptions::direct_unconstrained(
             regularization,
-            enforce_zero_rx,
-            enforce_zero_ry,
-            enforce_zero_rz,
-            solve_for_q,
-        ),
-        (true, true) => solve_pseudoinverse_augmented(
-            problem,
-            target_free_xyz,
-            regularization,
-            enforce_zero_rx,
-            enforce_zero_ry,
-            enforce_zero_rz,
-            solve_for_q,
-        ),
-        (false, false) => solve_pseudoinverse_l1(
-            problem,
-            target_free_xyz,
-            regularization,
+            use_l2,
             max_l1_iter,
+            particular_method,
             enforce_zero_rx,
             enforce_zero_ry,
             enforce_zero_rz,
             solve_for_q,
         ),
-        (false, true) => solve_pseudoinverse_l1_augmented(
-            problem,
-            target_free_xyz,
-            regularization,
-            max_l1_iter,
-            enforce_zero_rx,
-            enforce_zero_ry,
-            enforce_zero_rz,
-            solve_for_q,
-        ),
-    }
+    )
+    .map(|result| result.q)
 }
 
-// ─────────────────────────────────────────────────────────────
-//  NNLS  (spectral projected gradient)
-// ─────────────────────────────────────────────────────────────
-
-/// Result from the NNLS spectral projected-gradient solver.
-pub struct NnlsResult {
-    pub q: Vec<f64>,
-    pub iterations: usize,
-    pub converged: bool,
-}
-
-/// Find non-negative force densities via spectral projected gradient.
-///
-/// Solves  `min ‖Mq − p‖²   s.t.  q ≥ 0`  using only sparse matvecs.
-pub fn solve_nnls(
-    problem: &Problem,
-    target_free_xyz: &Array2<f64>,
-    max_iter: usize,
-    tol: f64,
-) -> Result<NnlsResult, TheseusError> {
-    let ne = problem.topology.num_edges;
-    let nn_free = problem.topology.free_node_indices.len();
-
-    let u = compute_target_member_vectors(problem, target_free_xyz);
-
-    let cn_t = problem.topology.free_incidence.transpose();
-    let cn = &problem.topology.free_incidence;
-
-    // p = [Pn_x; Pn_y; Pn_z]
-    let loads = &problem.free_node_loads;
-    let mut p = vec![0.0; 3 * nn_free];
-    for d in 0..3 {
-        let off = d * nn_free;
-        for i in 0..nn_free {
-            p[off + i] = loads[[i, d]];
-        }
-    }
-
-    // Initialise q = 1.0 (feasible starting point)
-    let mut q = vec![1.0; ne];
-
-    let mut prev_g = vec![0.0; ne];
-    let mut prev_q = vec![0.0; ne];
-    let mut alpha = 1.0;
-
-    let mut iterations = 0;
-    let mut converged = false;
-
-    for iter in 0..max_iter {
-        iterations = iter + 1;
-
-        // r = M·q − p
-        let mut r = apply_m(&cn_t, &u, &q, nn_free);
-        for (ri, &pi) in r.iter_mut().zip(p.iter()) {
-            *ri -= pi;
-        }
-
-        // g = M^T · r  (gradient of ½‖Mq−p‖²)
-        let g = apply_mt(cn, &u, &r, nn_free);
-
-        // Barzilai-Borwein step size (after first iteration)
-        if iter > 0 {
-            let mut dq_dot_dg = 0.0;
-            let mut dg_dot_dg = 0.0;
-            for k in 0..ne {
-                let dq = q[k] - prev_q[k];
-                let dg = g[k] - prev_g[k];
-                dq_dot_dg += dq * dg;
-                dg_dot_dg += dg * dg;
-            }
-            if dg_dot_dg > 0.0 && dq_dot_dg > 0.0 {
-                alpha = dq_dot_dg / dg_dot_dg;
-            }
-        }
-
-        // Save for BB computation
-        prev_q.copy_from_slice(&q);
-        prev_g.copy_from_slice(&g);
-
-        // Projected gradient step: q = max(0, q − α·g)
-        let mut proj_grad_norm_sq = 0.0;
-        for k in 0..ne {
-            let new_q = (q[k] - alpha * g[k]).max(0.0);
-            let pg = q[k] - new_q;
-            proj_grad_norm_sq += pg * pg;
-            q[k] = new_q;
-        }
-
-        // Convergence check: ‖projected gradient‖ < tol
-        if proj_grad_norm_sq.sqrt() < tol {
-            converged = true;
-            break;
-        }
-    }
-
-    // Validate solution
-    for (i, &v) in q.iter().enumerate() {
-        if !v.is_finite() {
-            return Err(TheseusError::Solver(format!(
-                "NNLS produced non-finite q at edge {i}",
-            )));
-        }
-    }
-
-    Ok(NnlsResult {
-        q,
-        iterations,
-        converged,
-    })
-}
-
-// ─────────────────────────────────────────────────────────────
-//  Sparse helpers
-// ─────────────────────────────────────────────────────────────
-
-/// Create a copy of a CSC matrix with each row `i` scaled by `row_scales[i]`.
-fn row_scaled_copy(mat: &SparseColMatOwned, row_scales: &[f64]) -> SparseColMatOwned {
-    let mut scaled = mat.clone();
-    for col in 0..scaled.ncols {
-        let start = scaled.col_ptrs[col] as usize;
-        let end_ = scaled.col_ptrs[col + 1] as usize;
-        for nz in start..end_ {
-            let row = scaled.row_indices[nz] as usize;
-            scaled.values[nz] *= row_scales[row];
-        }
-    }
-    scaled
-}
+include!("inverse_extra.rs");

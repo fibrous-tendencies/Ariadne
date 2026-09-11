@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 faer-sparse = "0.17"
 faer-core = "0.17"
+faer-svd = "0.17"
 dyn-stack = "0.10"
 ndarray = { version = "0.16", features = ["rayon"] }
 rayon = "1.11"
@@ -18,3 +19,4 @@ argmin = "0.10"
 argmin-math = { version = "0.4", features = ["vec"] }
 nurbsbook = { path = "../nurbsbook" }
 ariadne-lbfgsb = { path = "../lbfgsb", features = ["faer-backend"] }
+clarabel = "0.10"

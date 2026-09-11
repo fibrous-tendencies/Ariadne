@@ -24,6 +24,59 @@ public sealed class SolverResult
     public string TerminationReason { get; init; } = "";
 }
 
+public enum RigidityMethod
+{
+    Projector = 0,
+    DenseSvd = 1,
+    SparseQr = 2,
+}
+
+/// <summary>Managed Pellegrino–Calladine report; basis matrices are row-major.</summary>
+public sealed class RigidityReport
+{
+    public int Rank { get; init; }
+    public int SelfStressCount { get; init; }
+    public int RawMechanismCount { get; init; }
+    public int MechanismCount { get; init; }
+    public int RigidBodyCount { get; init; }
+    public double[] ParticularForces { get; init; } = [];
+    public double[] Residual { get; init; } = [];
+    public double ResidualRatio { get; init; }
+    public double[] SelfStressBasis { get; init; } = [];
+    public double[] MechanismBasis { get; init; } = [];
+    public double[] RigidBodyBasis { get; init; } = [];
+    public int SelfStressModeCount =>
+        SelfStressCount == 0 ? 0 : SelfStressBasis.Length / _numEdges;
+    public int MechanismModeCount =>
+        _equilibriumRows == 0 ? 0 : MechanismBasis.Length / _equilibriumRows;
+
+    internal int _numEdges;
+    internal int _equilibriumRows;
+}
+
+public enum MechanismClass
+{
+    PrestressUnstable = -1,
+    FiniteCandidate = 0,
+    PrestressStable = 1,
+}
+
+public sealed class LengthRetractionResult
+{
+    public double[] FreeXyz { get; init; } = [];
+    public int Iterations { get; init; }
+    public bool Converged { get; init; }
+    public double MaxLengthError { get; init; }
+    public double ResidualNorm { get; init; }
+}
+
+public sealed class PrestressClassification
+{
+    public double[] Eigenvalues { get; init; } = [];
+    public MechanismClass[] Classes { get; init; } = [];
+    public double[] RotatedMechanisms { get; init; } = [];
+}
+
 /// <summary>
 /// Managed wrapper around the native Theseus solver (theseus.dll).
 ///
@@ -35,14 +88,16 @@ public sealed class TheseusSolver : IDisposable
     private IntPtr _handle;
     private readonly int _numNodes;
     private readonly int _numEdges;
+    private readonly int _numFree;
     private bool _disposed;
     private TheseusInterop.NativeProgressCallback? _pinnedCallback;
 
-    private TheseusSolver(IntPtr handle, int numNodes, int numEdges)
+    private TheseusSolver(IntPtr handle, int numNodes, int numEdges, int numFree)
     {
         _handle = handle;
         _numNodes = numNodes;
         _numEdges = numEdges;
+        _numFree = numFree;
     }
 
     ~TheseusSolver()
@@ -141,7 +196,7 @@ public sealed class TheseusSolver : IDisposable
         if (handle == IntPtr.Zero)
             throw new TheseusException(GetLastError(), -1);
 
-        return new TheseusSolver(handle, numNodes, numEdges);
+        return new TheseusSolver(handle, numNodes, numEdges, numFree);
     }
 
     // ── Objectives ───────────────────────────────────────────
@@ -721,39 +776,17 @@ public sealed class TheseusSolver : IDisposable
 
     // ── Inverse solvers (experimental) ──────────────────────
 
-    public SolverResult SolvePseudoinverse(
+    /// particularMethod: 0 = Gram, 1 = Augmented, 2 = Sparse QR, 3 = Clarabel
+    /// (Direct unconstrained only; constrained Direct always uses Clarabel).
+    /// linearAlgebra: 0 = Direct, 1 = Iterative.
+    public SolverResult SolveInverseFdm(
         double[] targetFreeXyz, double regularization,
-        bool useL2 = true, int maxL1Iter = 20, bool useAugmented = false,
+        bool useL2 = true, int maxL1Iter = 20, int particularMethod = 3,
+        int linearAlgebra = 0,
         bool enforceZeroRx = false, bool enforceZeroRy = false,
-        bool enforceZeroRz = false, bool solveForQ = true)
-    {
-        ThrowIfDisposed();
-        var q = new double[_numEdges];
-        var xyz = new double[_numNodes * 3];
-        var lengths = new double[_numEdges];
-        var forces = new double[_numEdges];
-        var reactions = new double[_numNodes * 3];
-
-        Check(TheseusInterop.theseus_solve_pseudoinverse(
-            _handle, targetFreeXyz, regularization,
-            useL2 ? 1 : 0, (nuint)maxL1Iter, useAugmented ? 1 : 0,
-            enforceZeroRx ? 1 : 0, enforceZeroRy ? 1 : 0,
-            enforceZeroRz ? 1 : 0, solveForQ ? 1 : 0,
-            q, xyz, lengths, forces, reactions));
-
-        return new SolverResult
-        {
-            Xyz = xyz,
-            MemberLengths = lengths,
-            MemberForces = forces,
-            ForceDensities = q,
-            Reactions = reactions,
-            Iterations = 1,
-            Converged = true,
-        };
-    }
-
-    public SolverResult SolveNnls(double[] targetFreeXyz, int maxIter, double tol)
+        bool enforceZeroRz = false, bool solveForQ = true,
+        int[]? signs = null, double[]? lower = null, double[]? upper = null,
+        int maxIter = 500, double tol = 1e-6)
     {
         ThrowIfDisposed();
         var q = new double[_numEdges];
@@ -763,8 +796,19 @@ public sealed class TheseusSolver : IDisposable
         var reactions = new double[_numNodes * 3];
         nuint iterations = 0;
         byte converged = 0;
-        Check(TheseusInterop.theseus_solve_nnls(
-            _handle, targetFreeXyz, (nuint)maxIter, tol,
+        int[] signsArr = signs ?? [];
+        double[] lowerArr = lower ?? [];
+        double[] upperArr = upper ?? [];
+
+        Check(TheseusInterop.theseus_solve_inverse_fdm(
+            _handle, targetFreeXyz, regularization,
+            useL2 ? 1 : 0, (nuint)maxL1Iter, particularMethod, linearAlgebra,
+            enforceZeroRx ? 1 : 0, enforceZeroRy ? 1 : 0,
+            enforceZeroRz ? 1 : 0, solveForQ ? 1 : 0,
+            signsArr, (nuint)signsArr.Length,
+            lowerArr, (nuint)lowerArr.Length,
+            upperArr, (nuint)upperArr.Length,
+            (nuint)maxIter, tol,
             q, xyz, lengths, forces, reactions,
             ref iterations, ref converged));
 
@@ -777,6 +821,111 @@ public sealed class TheseusSolver : IDisposable
             Reactions = reactions,
             Iterations = (int)iterations,
             Converged = converged != 0,
+        };
+    }
+
+    public RigidityReport AnalyzeRigidity(
+        double[] targetFreeXyz,
+        RigidityMethod method = RigidityMethod.Projector,
+        bool includeRigidBodies = false,
+        int maxModes = 32)
+    {
+        ThrowIfDisposed();
+        if (maxModes < 0)
+            throw new ArgumentOutOfRangeException(nameof(maxModes));
+
+        nuint rank = 0, selfStressCount = 0, rawMechanismCount = 0;
+        nuint mechanismCount = 0, rigidCount = 0, particularLen = 0;
+        nuint residualLen = 0, selfStressLen = 0, mechanismLen = 0, rigidLen = 0;
+        Check(TheseusInterop.theseus_rigidity_report_sizes(
+            _handle, targetFreeXyz, (int)method, includeRigidBodies ? 1 : 0, (nuint)maxModes,
+            ref rank, ref selfStressCount, ref rawMechanismCount, ref mechanismCount,
+            ref rigidCount, ref particularLen, ref residualLen, ref selfStressLen,
+            ref mechanismLen, ref rigidLen));
+
+        var particular = new double[(int)particularLen];
+        var residual = new double[(int)residualLen];
+        var selfStress = new double[(int)selfStressLen];
+        var mechanisms = new double[(int)mechanismLen];
+        var rigidBodies = new double[(int)rigidLen];
+        double residualRatio = 0.0;
+        Check(TheseusInterop.theseus_rigidity_report_fill(
+            _handle, particular, particularLen, residual, residualLen, selfStress, selfStressLen,
+            mechanisms, mechanismLen, rigidBodies, rigidLen, ref residualRatio));
+
+        int equilibriumRows = (int)residualLen;
+        return new RigidityReport
+        {
+            Rank = (int)rank,
+            SelfStressCount = (int)selfStressCount,
+            RawMechanismCount = (int)rawMechanismCount,
+            MechanismCount = (int)mechanismCount,
+            RigidBodyCount = (int)rigidCount,
+            ParticularForces = particular,
+            Residual = residual,
+            ResidualRatio = residualRatio,
+            SelfStressBasis = selfStress,
+            MechanismBasis = mechanisms,
+            RigidBodyBasis = rigidBodies,
+            _numEdges = _numEdges,
+            _equilibriumRows = equilibriumRows,
+        };
+    }
+
+    public LengthRetractionResult RetractMemberLengths(
+        double[] initialFreeXyz,
+        double[] targetLengths,
+        int maxIterations = 30,
+        double tolerance = 1e-10)
+    {
+        ThrowIfDisposed();
+        if (initialFreeXyz.Length != _numFree * 3)
+            throw new ArgumentException("Coordinates must contain XYZ for every free node.", nameof(initialFreeXyz));
+        if (targetLengths.Length != _numEdges)
+            throw new ArgumentException("Target length count must match edge count.", nameof(targetLengths));
+        var output = new double[initialFreeXyz.Length];
+        nuint iterations = 0;
+        byte converged = 0;
+        double maxLengthError = 0.0, residualNorm = 0.0;
+        Check(TheseusInterop.theseus_retract_member_lengths(
+            _handle, initialFreeXyz, targetLengths, (nuint)Math.Max(0, maxIterations),
+            tolerance, output, ref iterations, ref converged, ref maxLengthError,
+            ref residualNorm));
+        return new LengthRetractionResult
+        {
+            FreeXyz = output,
+            Iterations = (int)iterations,
+            Converged = converged != 0,
+            MaxLengthError = maxLengthError,
+            ResidualNorm = residualNorm,
+        };
+    }
+
+    public PrestressClassification ClassifyPrestress(
+        double[] targetFreeXyz,
+        double[] prestressForces,
+        double[] mechanisms,
+        int mechanismCount,
+        double tolerance = 1e-10)
+    {
+        ThrowIfDisposed();
+        if (prestressForces.Length != _numEdges)
+            throw new ArgumentException("Prestress force count must match edge count.", nameof(prestressForces));
+        if (mechanismCount < 0 || (mechanismCount == 0
+            ? mechanisms.Length != 0
+            : mechanisms.Length % mechanismCount != 0))
+            throw new ArgumentException("Mechanism basis shape is inconsistent.", nameof(mechanisms));
+        var eigenvalues = new double[mechanismCount];
+        var classes = new int[mechanismCount];
+        var rotated = new double[mechanisms.Length];
+        Check(TheseusInterop.theseus_classify_prestress(
+            _handle, targetFreeXyz, prestressForces, mechanisms,
+            (nuint)mechanismCount, tolerance, eigenvalues, classes, rotated));
+        return new PrestressClassification
+        {
+            Eigenvalues = eigenvalues,
+            Classes = Array.ConvertAll(classes, value => (MechanismClass)value),
+            RotatedMechanisms = rotated,
         };
     }
 

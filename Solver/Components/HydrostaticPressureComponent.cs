@@ -116,5 +116,5 @@ public class HydrostaticPressureComponent : GH_Component
 
     protected override Bitmap Icon => null!;
     public override Guid ComponentGuid => new("F2A8B7C6-ED93-4FD4-A1B0-7C6D5E8F9A01");
-    public override GH_Exposure Exposure => GH_Exposure.tertiary;
+    public override GH_Exposure Exposure => GH_Exposure.hidden;
 }

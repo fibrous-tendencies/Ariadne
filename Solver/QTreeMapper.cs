@@ -31,13 +31,41 @@ public sealed record EdgeValueTree(IReadOnlyList<EdgeValueBranch> Branches)
         for (int branchIndex = 0; branchIndex < tree.PathCount; branchIndex++)
         {
             GH_Path path = tree.Paths[branchIndex];
-            var values = tree.get_Branch(path)
-                .OfType<GH_Number>()
-                .Select(number => number.Value)
-                .ToArray();
+            var values = NumericValues(tree.get_Branch(path));
             branches.Add(new EdgeValueBranch(path.ToString(), values));
         }
         return new EdgeValueTree(branches);
+    }
+
+    internal static EdgeValueTree FromGh(GH_Structure<GH_Integer> tree)
+    {
+        ArgumentNullException.ThrowIfNull(tree);
+        var branches = new List<EdgeValueBranch>(tree.PathCount);
+        for (int branchIndex = 0; branchIndex < tree.PathCount; branchIndex++)
+        {
+            GH_Path path = tree.Paths[branchIndex];
+            var values = NumericValues(tree.get_Branch(path));
+            branches.Add(new EdgeValueBranch(path.ToString(), values));
+        }
+        return new EdgeValueTree(branches);
+    }
+
+    private static double[] NumericValues(System.Collections.IList branch)
+    {
+        var values = new List<double>(branch.Count);
+        foreach (var item in branch)
+        {
+            switch (item)
+            {
+                case GH_Number number:
+                    values.Add(number.Value);
+                    break;
+                case GH_Integer integer:
+                    values.Add(integer.Value);
+                    break;
+            }
+        }
+        return values.ToArray();
     }
 }
 
@@ -49,6 +77,24 @@ internal static class QTreeMapper
     {
         ArgumentNullException.ThrowIfNull(qTree);
         return Map(EdgeValueTree.FromGh(qTree), edgePaths, "q");
+    }
+
+    public static QTreeMappingResult Map(
+        GH_Structure<GH_Number> tree,
+        IReadOnlyList<GH_Path> edgePaths,
+        string label)
+    {
+        ArgumentNullException.ThrowIfNull(tree);
+        return Map(EdgeValueTree.FromGh(tree), edgePaths, label);
+    }
+
+    public static QTreeMappingResult Map(
+        GH_Structure<GH_Integer> tree,
+        IReadOnlyList<GH_Path> edgePaths,
+        string label)
+    {
+        ArgumentNullException.ThrowIfNull(tree);
+        return Map(EdgeValueTree.FromGh(tree), edgePaths, label);
     }
 
     public static QTreeMappingResult Map(

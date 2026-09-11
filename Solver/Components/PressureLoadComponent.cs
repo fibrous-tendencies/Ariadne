@@ -135,5 +135,5 @@ public class PressureLoadComponent : GH_Component
 
     protected override Bitmap Icon => null!;
     public override Guid ComponentGuid => new("E1F7A6B5-DB82-4EC3-F0A9-6B5C4D7E8F90");
-    public override GH_Exposure Exposure => GH_Exposure.tertiary;
+    public override GH_Exposure Exposure => GH_Exposure.hidden;
 }

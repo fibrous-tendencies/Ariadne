@@ -160,6 +160,23 @@ public sealed class QTreeMapperTests
         Assert.Contains("has 3 edge(s)", result.Error);
     }
 
+    [Fact]
+    public void IntegerTreesBroadcastAndMatchLikeNumberBounds()
+    {
+        var tree = new GH_Structure<GH_Integer>();
+        tree.Append(new GH_Integer(1), Path(0, 1));
+        tree.Append(new GH_Integer(-1), Path(2, 3));
+        tree.Append(new GH_Integer(-1), Path(2, 3));
+
+        var result = QTreeMapper.Map(
+            tree,
+            [Path(0, 1), Path(0, 1), Path(2, 3), Path(2, 3)],
+            "Signs");
+
+        Assert.True(result.Success);
+        Assert.Equal([1.0, 1.0, -1.0, -1.0], result.Values);
+    }
+
     private static GH_Path Path(params int[] indices) => new(indices);
 
     private static GH_Structure<GH_Number> Tree(

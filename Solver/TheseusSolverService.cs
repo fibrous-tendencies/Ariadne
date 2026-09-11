@@ -157,56 +157,26 @@ public static class TheseusSolverService
         return BuildResult(network, result, context);
     }
 
-    /// <summary>
-    /// Solve for force densities via pseudoinverse of the equilibrium system.
-    /// Given target free-node positions, finds q that best satisfies equilibrium,
-    /// then performs a forward FDM solve with the resulting q.
-    /// </summary>
-    public static SolveResult SolvePseudoinverse(
+    /// Solve inverse FDM at a target geometry, then forward-solve with the recovered q.
+    /// particularMethod: 0 = Gram, 1 = Augmented, 2 = Sparse QR, 3 = Clarabel
+    /// (Direct unconstrained only; constrained Direct always uses Clarabel).
+    /// linearAlgebra: 0 = Direct, 1 = Iterative.
+    public static SolveResult SolveInverseFdm(
         FDM_Network network,
         SolverInputs inputs,
         double[] targetFreeXyz,
         double regularization = 1e-6,
         bool useL2 = true,
         int maxL1Iter = 20,
-        bool useAugmented = false,
+        int particularMethod = 3,
+        int linearAlgebra = 0,
         bool enforceZeroRx = false,
         bool enforceZeroRy = false,
         bool enforceZeroRz = false,
-        bool solveForQ = true)
-    {
-        ValidateCommon(network, inputs);
-        var context = BuildContext(network);
-        var data = BuildSolverData(network, inputs, context);
-
-        using var solver = TheseusSolver.Create(
-            data.NumEdges, data.NumNodes, data.NumFree,
-            data.CooRows, data.CooCols, data.CooVals,
-            data.FreeIndices, data.FixedIndices,
-            data.Loads, data.FixedPositions,
-            data.QInit, data.LowerBounds, data.UpperBounds,
-            data.VariableNodeIndices, data.VariableSupportKinds, data.VariableSupportLambdas, data.SphereRadii,
-            data.RollerEnabled, data.RollerLower, data.RollerUpper, data.RailStart, data.RailEnd,
-            data.NurbsOffsets, data.NurbsLengths, data.NurbsData);
-        solver.SetQParameterizationMode((int)ResolveQParameterizationMode(
-            inputs.QParameterizationMode, data.LowerBounds, data.UpperBounds));
-
-        ApplyLoadConfig(solver, inputs, context);
-
-        var result = solver.SolvePseudoinverse(targetFreeXyz, regularization, useL2, maxL1Iter, useAugmented,
-            enforceZeroRx, enforceZeroRy, enforceZeroRz, solveForQ);
-        return BuildResult(network, result, context);
-    }
-
-    /// <summary>
-    /// Solve for non-negative force densities via NNLS (spectral projected gradient).
-    /// Given target free-node positions, finds q >= 0 minimising the equilibrium residual,
-    /// then performs a forward FDM solve with the resulting q.
-    /// </summary>
-    public static SolveResult SolveNnls(
-        FDM_Network network,
-        SolverInputs inputs,
-        double[] targetFreeXyz,
+        bool solveForQ = true,
+        int[]? signs = null,
+        double[]? lower = null,
+        double[]? upper = null,
         int maxIter = 500,
         double tol = 1e-6)
     {
@@ -228,8 +198,90 @@ public static class TheseusSolverService
 
         ApplyLoadConfig(solver, inputs, context);
 
-        var result = solver.SolveNnls(targetFreeXyz, maxIter, tol);
+        var result = solver.SolveInverseFdm(targetFreeXyz, regularization, useL2, maxL1Iter, particularMethod,
+            linearAlgebra, enforceZeroRx, enforceZeroRy, enforceZeroRz, solveForQ,
+            signs, lower, upper, maxIter, tol);
         return BuildResult(network, result, context);
+    }
+
+    /// <summary>Analyze force and displacement null spaces at a target geometry.</summary>
+    public static RigidityReport AnalyzeRigidity(
+        FDM_Network network,
+        SolverInputs inputs,
+        double[] targetFreeXyz,
+        RigidityMethod method = RigidityMethod.Projector,
+        bool includeRigidBodies = false,
+        int maxModes = 32)
+    {
+        ValidateCommon(network, inputs);
+        if (targetFreeXyz.Length != network.FreeNodes.Count * 3)
+            throw new ArgumentException(
+                "Target coordinates must contain XYZ for every free node.",
+                nameof(targetFreeXyz));
+
+        var context = BuildContext(network);
+        var data = BuildSolverData(network, inputs, context);
+        using var solver = TheseusSolver.Create(
+            data.NumEdges, data.NumNodes, data.NumFree,
+            data.CooRows, data.CooCols, data.CooVals,
+            data.FreeIndices, data.FixedIndices,
+            data.Loads, data.FixedPositions,
+            data.QInit, data.LowerBounds, data.UpperBounds);
+        return solver.AnalyzeRigidity(targetFreeXyz, method, includeRigidBodies, maxModes);
+    }
+
+    /// <summary>Retract free-node coordinates onto per-member target lengths.</summary>
+    public static LengthRetractionResult RetractMemberLengths(
+        FDM_Network network,
+        SolverInputs inputs,
+        double[] initialFreeXyz,
+        double[] targetLengths,
+        int maxIterations = 30,
+        double tolerance = 1e-10)
+    {
+        ValidateCommon(network, inputs);
+        if (initialFreeXyz.Length != network.FreeNodes.Count * 3)
+            throw new ArgumentException(
+                "Coordinates must contain XYZ for every free node.",
+                nameof(initialFreeXyz));
+        if (targetLengths.Length != network.Graph.Ne)
+            throw new ArgumentException(
+                "Target length count must match edge count.",
+                nameof(targetLengths));
+
+        var context = BuildContext(network);
+        var data = BuildSolverData(network, inputs, context);
+        using var solver = TheseusSolver.Create(
+            data.NumEdges, data.NumNodes, data.NumFree,
+            data.CooRows, data.CooCols, data.CooVals,
+            data.FreeIndices, data.FixedIndices,
+            data.Loads, data.FixedPositions,
+            data.QInit, data.LowerBounds, data.UpperBounds);
+        return solver.RetractMemberLengths(
+            initialFreeXyz, targetLengths, maxIterations, tolerance);
+    }
+
+    /// <summary>Classify and rotate mechanism modes using prestress stiffness.</summary>
+    public static PrestressClassification ClassifyPrestress(
+        FDM_Network network,
+        SolverInputs inputs,
+        double[] targetFreeXyz,
+        double[] prestressForces,
+        double[] mechanisms,
+        int mechanismCount,
+        double tolerance = 1e-10)
+    {
+        ValidateCommon(network, inputs);
+        var context = BuildContext(network);
+        var data = BuildSolverData(network, inputs, context);
+        using var solver = TheseusSolver.Create(
+            data.NumEdges, data.NumNodes, data.NumFree,
+            data.CooRows, data.CooCols, data.CooVals,
+            data.FreeIndices, data.FixedIndices,
+            data.Loads, data.FixedPositions,
+            data.QInit, data.LowerBounds, data.UpperBounds);
+        return solver.ClassifyPrestress(
+            targetFreeXyz, prestressForces, mechanisms, mechanismCount, tolerance);
     }
 
     /// <summary>

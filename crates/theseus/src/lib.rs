@@ -18,6 +18,7 @@ pub mod fdm;
 pub mod ffi;
 pub mod gradients;
 pub mod inverse;
+pub mod nullspace;
 pub mod objectives;
 pub mod optimizer;
 pub mod sparse;

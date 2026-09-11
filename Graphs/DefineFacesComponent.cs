@@ -119,5 +119,5 @@ public class DefineFacesComponent : GH_Component
 
     protected override Bitmap Icon => null!;
     public override Guid ComponentGuid => new Guid("B8E4C3D2-AE5F-4B90-C7D6-3F2E1A4B5C6D");
-    public override GH_Exposure Exposure => GH_Exposure.secondary;
+    public override GH_Exposure Exposure => GH_Exposure.hidden;
 }

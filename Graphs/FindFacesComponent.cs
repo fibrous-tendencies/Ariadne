@@ -102,5 +102,5 @@ public class FindFacesComponent : GH_Component
 
     protected override Bitmap Icon => null!;
     public override Guid ComponentGuid => new Guid("A7F3B2C1-9D4E-4A8F-B6C5-2E1D0F3A4B5C");
-    public override GH_Exposure Exposure => GH_Exposure.secondary;
+    public override GH_Exposure Exposure => GH_Exposure.hidden;
 }

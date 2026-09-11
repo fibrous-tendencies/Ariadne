@@ -180,6 +180,7 @@ struct TheseusHandleState {
     pub progress_callback: Option<ProgressCallback>,
     pub report_frequency: usize,
     pub last_termination_reason: String,
+    pub pending_rigidity_report: Option<crate::nullspace::NullspaceReport>,
 }
 
 struct HandleLifecycle {
@@ -749,7 +750,10 @@ unsafe fn create_inner_with_variable_supports(
         let lambdas = if support_lambdas.is_null() {
             None
         } else {
-            Some(slice::from_raw_parts(support_lambdas, num_variable_supports))
+            Some(slice::from_raw_parts(
+                support_lambdas,
+                num_variable_supports,
+            ))
         };
         let radii = slice::from_raw_parts(sphere_radii, num_variable_supports);
         let roller_en = slice::from_raw_parts(roller_enabled, num_variable_supports * 3);
@@ -924,6 +928,7 @@ unsafe fn create_inner_with_variable_supports(
                 progress_callback: None,
                 report_frequency: 1,
                 last_termination_reason: "not run".to_string(),
+                pending_rigidity_report: None,
             }),
             active_cancel: None,
             active_cancel_scope: None,
@@ -2357,18 +2362,346 @@ unsafe fn solve_forward_inner(
 //  Inverse solvers  (experimental)
 // ─────────────────────────────────────────────────────────────
 
-/// Solve for force densities via pseudoinverse of the equilibrium system.
+fn rigidity_options(
+    method: i32,
+    include_rigid_bodies: i32,
+    max_modes: usize,
+) -> Result<crate::nullspace::NullspaceOptions, TheseusError> {
+    let method = match method {
+        0 => crate::nullspace::NullspaceMethod::Projector,
+        1 => crate::nullspace::NullspaceMethod::Svd,
+        2 => crate::nullspace::NullspaceMethod::SparseQr,
+        _ => {
+            return Err(TheseusError::Shape(format!(
+                "unknown rigidity method code {method}"
+            )))
+        }
+    };
+    Ok(crate::nullspace::NullspaceOptions {
+        method,
+        max_modes,
+        include_rigid_bodies: include_rigid_bodies != 0,
+        ..Default::default()
+    })
+}
+
+unsafe fn rigidity_report(
+    handle: *mut TheseusHandle,
+    target_free_xyz: *const f64,
+    method: i32,
+    include_rigid_bodies: i32,
+    max_modes: usize,
+) -> Result<crate::nullspace::NullspaceReport, TheseusError> {
+    let h = require_handle(handle)?;
+    let nn_free = h.problem.topology.free_node_indices.len();
+    if target_free_xyz.is_null() && nn_free != 0 {
+        return Err(TheseusError::Shape("null target_free_xyz".into()));
+    }
+    let target_values = if nn_free == 0 {
+        Vec::new()
+    } else {
+        slice::from_raw_parts(target_free_xyz, nn_free * 3).to_vec()
+    };
+    let target = Array2::from_shape_vec((nn_free, 3), target_values)
+        .map_err(|e| TheseusError::Shape(format!("target_free_xyz: {e}")))?;
+    let system =
+        crate::nullspace::EquilibriumSystem::force(&h.problem, &target, false, false, false)?;
+    crate::nullspace::analyze(
+        &system,
+        &rigidity_options(method, include_rigid_bodies, max_modes)?,
+    )
+}
+
+/// Query scalar results and caller-owned buffer sizes for a rigidity report.
+#[no_mangle]
+pub unsafe extern "C" fn theseus_rigidity_report_sizes(
+    handle: *mut TheseusHandle,
+    target_free_xyz: *const f64,
+    method: i32,
+    include_rigid_bodies: i32,
+    max_modes: usize,
+    out_rank: *mut usize,
+    out_self_stress_count: *mut usize,
+    out_mechanism_raw_count: *mut usize,
+    out_mechanism_count: *mut usize,
+    out_rigid_count: *mut usize,
+    out_particular_len: *mut usize,
+    out_residual_len: *mut usize,
+    out_self_stress_len: *mut usize,
+    out_mechanism_len: *mut usize,
+    out_rigid_len: *mut usize,
+) -> i32 {
+    ffi_guard(AssertUnwindSafe(|| {
+        let report = rigidity_report(
+            handle,
+            target_free_xyz,
+            method,
+            include_rigid_bodies,
+            max_modes,
+        )?;
+        let outputs = [
+            out_rank,
+            out_self_stress_count,
+            out_mechanism_raw_count,
+            out_mechanism_count,
+            out_rigid_count,
+            out_particular_len,
+            out_residual_len,
+            out_self_stress_len,
+            out_mechanism_len,
+            out_rigid_len,
+        ];
+        if outputs.iter().any(|output| output.is_null()) {
+            return Err(TheseusError::Shape(
+                "null rigidity size output pointer".into(),
+            ));
+        }
+        *out_rank = report.rank;
+        *out_self_stress_count = report.s;
+        *out_mechanism_raw_count = report.m_raw;
+        *out_mechanism_count = report.m;
+        *out_rigid_count = report.n_rigid;
+        *out_particular_len = report.particular_t.len();
+        *out_residual_len = report.residual_r.len();
+        *out_self_stress_len = report.self_stress.len();
+        *out_mechanism_len = report.mechanisms.len();
+        *out_rigid_len = report.rigid_bodies.len();
+        require_handle(handle)?.pending_rigidity_report = Some(report);
+        Ok(())
+    }))
+}
+
+fn copy_array2(
+    output: *mut f64,
+    output_len: usize,
+    values: &Array2<f64>,
+    name: &str,
+) -> Result<(), TheseusError> {
+    if output_len != values.len() {
+        return Err(TheseusError::Shape(format!(
+            "{name} buffer length {output_len}, expected {}",
+            values.len()
+        )));
+    }
+    if output.is_null() && output_len != 0 {
+        return Err(TheseusError::Shape(format!("null {name} output")));
+    }
+    for ((row, col), value) in values.indexed_iter() {
+        unsafe {
+            *output.add(row * values.ncols() + col) = *value;
+        }
+    }
+    Ok(())
+}
+
+/// Fill caller-owned buffers previously sized by `theseus_rigidity_report_sizes`.
+#[no_mangle]
+pub unsafe extern "C" fn theseus_rigidity_report_fill(
+    handle: *mut TheseusHandle,
+    out_particular_t: *mut f64,
+    particular_len: usize,
+    out_residual: *mut f64,
+    residual_len: usize,
+    out_self_stress: *mut f64,
+    self_stress_len: usize,
+    out_mechanisms: *mut f64,
+    mechanism_len: usize,
+    out_rigid_bodies: *mut f64,
+    rigid_len: usize,
+    out_residual_ratio: *mut f64,
+) -> i32 {
+    ffi_guard(AssertUnwindSafe(|| {
+        let report = require_handle(handle)?
+            .pending_rigidity_report
+            .take()
+            .ok_or_else(|| {
+                TheseusError::Solver("rigidity fill requires a successful size query first".into())
+            })?;
+        if out_residual_ratio.is_null() {
+            return Err(TheseusError::Shape(
+                "null residual ratio output pointer".into(),
+            ));
+        }
+        copy_array2(
+            out_particular_t,
+            particular_len,
+            &report.particular_t,
+            "particular force",
+        )?;
+        if residual_len != report.residual_r.len() {
+            return Err(TheseusError::Shape(format!(
+                "residual buffer length {residual_len}, expected {}",
+                report.residual_r.len()
+            )));
+        }
+        if out_residual.is_null() && residual_len != 0 {
+            return Err(TheseusError::Shape("null residual output".into()));
+        }
+        if residual_len != 0 {
+            slice::from_raw_parts_mut(out_residual, residual_len)
+                .copy_from_slice(&report.residual_r);
+        }
+        copy_array2(
+            out_self_stress,
+            self_stress_len,
+            &report.self_stress,
+            "self-stress",
+        )?;
+        copy_array2(
+            out_mechanisms,
+            mechanism_len,
+            &report.mechanisms,
+            "mechanism",
+        )?;
+        copy_array2(
+            out_rigid_bodies,
+            rigid_len,
+            &report.rigid_bodies,
+            "rigid-body",
+        )?;
+        *out_residual_ratio = report.residual_ratio;
+        Ok(())
+    }))
+}
+
+/// Retract free-node coordinates onto a supplied set of per-member lengths.
+#[no_mangle]
+pub unsafe extern "C" fn theseus_retract_member_lengths(
+    handle: *mut TheseusHandle,
+    initial_free_xyz: *const f64,
+    target_lengths: *const f64,
+    max_iterations: usize,
+    tolerance: f64,
+    out_free_xyz: *mut f64,
+    out_iterations: *mut usize,
+    out_converged: *mut bool,
+    out_max_length_error: *mut f64,
+    out_residual_norm: *mut f64,
+) -> i32 {
+    ffi_guard(AssertUnwindSafe(|| {
+        let h = require_handle(handle)?;
+        let n_free = h.problem.topology.free_node_indices.len();
+        let n_edges = h.problem.topology.num_edges;
+        if (initial_free_xyz.is_null() && n_free != 0)
+            || (target_lengths.is_null() && n_edges != 0)
+            || (out_free_xyz.is_null() && n_free != 0)
+            || out_iterations.is_null()
+            || out_converged.is_null()
+            || out_max_length_error.is_null()
+            || out_residual_norm.is_null()
+        {
+            return Err(TheseusError::Shape(
+                "null length-retraction input or output pointer".into(),
+            ));
+        }
+        let initial = Array2::from_shape_vec(
+            (n_free, 3),
+            slice::from_raw_parts(initial_free_xyz, n_free * 3).to_vec(),
+        )
+        .map_err(|error| TheseusError::Shape(format!("retraction XYZ: {error}")))?;
+        let lengths = slice::from_raw_parts(target_lengths, n_edges);
+        let result = crate::nullspace::retract_member_lengths(
+            &h.problem,
+            &initial,
+            lengths,
+            &crate::nullspace::LengthRetractionOptions {
+                max_iterations,
+                tolerance,
+                ..Default::default()
+            },
+        )?;
+        for ((row, col), value) in result.positions.indexed_iter() {
+            *out_free_xyz.add(row * 3 + col) = *value;
+        }
+        *out_iterations = result.iterations;
+        *out_converged = result.converged;
+        *out_max_length_error = result.max_length_error;
+        *out_residual_norm = result.residual_norm;
+        Ok(())
+    }))
+}
+
+/// Classify and rotate a caller-supplied mechanism basis by restricted
+/// geometric stiffness. Mechanisms and output modes are row-major.
+#[no_mangle]
+pub unsafe extern "C" fn theseus_classify_prestress(
+    handle: *mut TheseusHandle,
+    target_free_xyz: *const f64,
+    prestress_t: *const f64,
+    mechanisms: *const f64,
+    mechanism_count: usize,
+    tolerance: f64,
+    out_eigenvalues: *mut f64,
+    out_classes: *mut i32,
+    out_rotated_mechanisms: *mut f64,
+) -> i32 {
+    ffi_guard(AssertUnwindSafe(|| {
+        let h = require_handle(handle)?;
+        let n_free = h.problem.topology.free_node_indices.len();
+        let n_edges = h.problem.topology.num_edges;
+        let rows = 3 * n_free;
+        if (target_free_xyz.is_null() && n_free != 0)
+            || (prestress_t.is_null() && n_edges != 0)
+            || (mechanisms.is_null() && rows * mechanism_count != 0)
+            || (out_eigenvalues.is_null() && mechanism_count != 0)
+            || (out_classes.is_null() && mechanism_count != 0)
+            || (out_rotated_mechanisms.is_null() && rows * mechanism_count != 0)
+        {
+            return Err(TheseusError::Shape(
+                "null prestress-classification input or output pointer".into(),
+            ));
+        }
+        let target = Array2::from_shape_vec(
+            (n_free, 3),
+            slice::from_raw_parts(target_free_xyz, n_free * 3).to_vec(),
+        )
+        .map_err(|error| TheseusError::Shape(format!("classification XYZ: {error}")))?;
+        let system =
+            crate::nullspace::EquilibriumSystem::force(&h.problem, &target, false, false, false)?;
+        let basis = Array2::from_shape_vec(
+            (rows, mechanism_count),
+            slice::from_raw_parts(mechanisms, rows * mechanism_count).to_vec(),
+        )
+        .map_err(|error| TheseusError::Shape(format!("mechanism basis: {error}")))?;
+        let classification = crate::nullspace::classify_prestress_stability(
+            &h.problem,
+            &system,
+            slice::from_raw_parts(prestress_t, n_edges),
+            &basis,
+            tolerance,
+        )?;
+        for mode in 0..mechanism_count {
+            *out_eigenvalues.add(mode) = classification.eigenvalues[mode];
+            *out_classes.add(mode) = match classification.classes[mode] {
+                crate::nullspace::MechanismClass::PrestressStable => 1,
+                crate::nullspace::MechanismClass::FiniteCandidate => 0,
+                crate::nullspace::MechanismClass::PrestressUnstable => -1,
+            };
+        }
+        for row in 0..rows {
+            for mode in 0..mechanism_count {
+                let value = (0..mechanism_count)
+                    .map(|source| {
+                        basis[[row, source]] * classification.eigenvectors[[source, mode]]
+                    })
+                    .sum();
+                *out_rotated_mechanisms.add(row * mechanism_count + mode) = value;
+            }
+        }
+        Ok(())
+    }))
+}
+
+/// Solve inverse FDM at a target geometry, then forward-solve.
 ///
-/// Given target free-node positions, finds q that best satisfies M q = p.
-/// When `use_l2` is non-zero, uses L2 (least-squares) via Tikhonov-regularised
-/// normal equations (single solve).  When zero, uses L1 (sum of absolute
-/// residuals) via IRLS for up to `max_l1_iter` iterations.
-///
-/// When `use_augmented` is non-zero, uses the augmented saddle-point system
-/// instead of forming M^T M.  This avoids fill-in explosion and is faster
-/// for large meshes (>50k edges).  Requires `regularization > 0`.
-///
-/// Then performs a forward FDM solve with the resulting q to produce final geometry.
+/// `particular_method` ABI mapping (append-only):
+/// 0 = Gram, 1 = augmented saddle (MP / Tikhonov), 2 = sparse QR,
+/// 3 = Clarabel. Clarabel is valid for unconstrained Direct solves; Direct
+/// solves with any effective finite sign/bound route to Clarabel regardless
+/// of this value.
+/// Used only for Direct unconstrained solves.
+/// `linear_algebra`: 0 = Direct, 1 = Iterative.
+/// Empty `signs` / `lower` / `upper` (length 0) means unconstrained on that channel.
 ///
 /// `target_free_xyz` must point to `num_free * 3` doubles (row-major).
 ///
@@ -2377,94 +2710,24 @@ unsafe fn solve_forward_inner(
 /// # Safety
 /// Valid handle and output buffers.
 #[no_mangle]
-pub unsafe extern "C" fn theseus_solve_pseudoinverse(
+pub unsafe extern "C" fn theseus_solve_inverse_fdm(
     handle: *mut TheseusHandle,
     target_free_xyz: *const f64,
     regularization: f64,
     use_l2: i32,
     max_l1_iter: usize,
-    use_augmented: i32,
+    particular_method: i32,
+    linear_algebra: i32,
     enforce_zero_rx: i32,
     enforce_zero_ry: i32,
     enforce_zero_rz: i32,
     solve_for_q: i32,
-    out_q: *mut f64,
-    out_xyz: *mut f64,
-    out_lengths: *mut f64,
-    out_forces: *mut f64,
-    out_reactions: *mut f64,
-) -> i32 {
-    ffi_guard(AssertUnwindSafe(|| {
-        let h = require_handle(handle)?;
-        let nn_free = h.problem.topology.free_node_indices.len();
-        let nn = h.problem.topology.num_nodes;
-        let ne = h.problem.topology.num_edges;
-
-        let target = Array2::from_shape_vec(
-            (nn_free, 3),
-            slice::from_raw_parts(target_free_xyz, nn_free * 3).to_vec(),
-        )
-        .map_err(|e| TheseusError::Shape(format!("target_free_xyz: {e}")))?;
-
-        let q = crate::inverse::solve_pseudoinverse_dispatch(
-            &h.problem,
-            &target,
-            regularization,
-            use_l2 != 0,
-            max_l1_iter,
-            use_augmented != 0,
-            enforce_zero_rx != 0,
-            enforce_zero_ry != 0,
-            enforce_zero_rz != 0,
-            solve_for_q != 0,
-        )?;
-
-        // Forward solve with the computed q (with self-weight/pressure if active)
-        let mut cache = FdmCache::new(&h.problem)?;
-        let anchors = crate::variable_supports::map_latents_to_positions(
-            &h.problem,
-            &h.state.variable_anchor_latents,
-        )?;
-        crate::fdm::solve_fdm_with_loads(&mut cache, &q, &h.problem, &anchors, 1e-12)?;
-
-        // Copy outputs
-        slice::from_raw_parts_mut(out_q, ne).copy_from_slice(&q);
-
-        let xyz_out = slice::from_raw_parts_mut(out_xyz, nn * 3);
-        for i in 0..nn {
-            for d in 0..3 {
-                xyz_out[i * 3 + d] = cache.nf[[i, d]];
-            }
-        }
-        slice::from_raw_parts_mut(out_lengths, ne).copy_from_slice(&cache.member_lengths);
-        slice::from_raw_parts_mut(out_forces, ne).copy_from_slice(&cache.member_forces);
-
-        let r_out = slice::from_raw_parts_mut(out_reactions, nn * 3);
-        for i in 0..nn {
-            for d in 0..3 {
-                r_out[i * 3 + d] = cache.reactions[[i, d]];
-            }
-        }
-
-        Ok(())
-    }))
-}
-
-/// Solve for non-negative force densities via NNLS (spectral projected gradient).
-///
-/// Given target free-node positions, finds q ≥ 0 that minimises ‖Mq − p‖².
-/// Then performs a forward FDM solve with the resulting q.
-///
-/// `target_free_xyz` must point to `num_free * 3` doubles (row-major).
-///
-/// Returns 0 on success, -1 on error, -2 on internal panic.
-///
-/// # Safety
-/// Valid handle and output buffers.
-#[no_mangle]
-pub unsafe extern "C" fn theseus_solve_nnls(
-    handle: *mut TheseusHandle,
-    target_free_xyz: *const f64,
+    signs: *const i32,
+    n_signs: usize,
+    lower: *const f64,
+    n_lower: usize,
+    upper: *const f64,
+    n_upper: usize,
     max_iter: usize,
     tol: f64,
     out_q: *mut f64,
@@ -2487,10 +2750,45 @@ pub unsafe extern "C" fn theseus_solve_nnls(
         )
         .map_err(|e| TheseusError::Shape(format!("target_free_xyz: {e}")))?;
 
-        let result = crate::inverse::solve_nnls(&h.problem, &target, max_iter, tol)?;
+        let copy_i32 = |ptr: *const i32, n: usize| -> Vec<i32> {
+            if n == 0 || ptr.is_null() {
+                Vec::new()
+            } else {
+                slice::from_raw_parts(ptr, n).to_vec()
+            }
+        };
+        let copy_f64 = |ptr: *const f64, n: usize| -> Vec<f64> {
+            if n == 0 || ptr.is_null() {
+                Vec::new()
+            } else {
+                slice::from_raw_parts(ptr, n).to_vec()
+            }
+        };
+
+        let method = crate::inverse::ParticularMethod::try_from(particular_method)?;
+        let algebra = crate::inverse::LinearAlgebra::try_from(linear_algebra)?;
+        let result = crate::inverse::solve_inverse_fdm(
+            &h.problem,
+            &target,
+            crate::inverse::InverseFdmOptions {
+                regularization,
+                use_l2: use_l2 != 0,
+                max_l1_iter,
+                particular_method: method,
+                linear_algebra: algebra,
+                enforce_zero_rx: enforce_zero_rx != 0,
+                enforce_zero_ry: enforce_zero_ry != 0,
+                enforce_zero_rz: enforce_zero_rz != 0,
+                solve_for_q: solve_for_q != 0,
+                signs: copy_i32(signs, n_signs),
+                lower: copy_f64(lower, n_lower),
+                upper: copy_f64(upper, n_upper),
+                max_iter,
+                tol,
+            },
+        )?;
         let q = result.q;
 
-        // Forward solve with the computed q (with self-weight/pressure if active)
         let mut cache = FdmCache::new(&h.problem)?;
         let anchors = crate::variable_supports::map_latents_to_positions(
             &h.problem,
@@ -2498,7 +2796,6 @@ pub unsafe extern "C" fn theseus_solve_nnls(
         )?;
         crate::fdm::solve_fdm_with_loads(&mut cache, &q, &h.problem, &anchors, 1e-12)?;
 
-        // Copy outputs
         slice::from_raw_parts_mut(out_q, ne).copy_from_slice(&q);
 
         let xyz_out = slice::from_raw_parts_mut(out_xyz, nn * 3);
@@ -2517,8 +2814,12 @@ pub unsafe extern "C" fn theseus_solve_nnls(
             }
         }
 
-        *out_iterations = result.iterations;
-        *out_converged = result.converged;
+        if !out_iterations.is_null() {
+            *out_iterations = result.iterations;
+        }
+        if !out_converged.is_null() {
+            *out_converged = result.converged;
+        }
 
         Ok(())
     }))
@@ -2698,6 +2999,134 @@ mod lifecycle_tests {
             let clean_run = begin_run(handle_ref).unwrap();
             assert!(!clean_run.cancel.load(Ordering::Acquire));
             drop(clean_run);
+            theseus_free(handle);
+        }
+    }
+
+    #[test]
+    fn sparse_qr_rigidity_report_size_query_and_fill_round_trip() {
+        unsafe {
+            let handle = tiny_handle();
+            assert!(!handle.is_null());
+            let target = [1.0, 0.0, 0.0];
+            let mut rank = 0;
+            let mut s = 0;
+            let mut m_raw = 0;
+            let mut m = 0;
+            let mut n_rigid = 0;
+            let mut particular_len = 0;
+            let mut residual_len = 0;
+            let mut self_stress_len = 0;
+            let mut mechanism_len = 0;
+            let mut rigid_len = 0;
+            assert_eq!(
+                theseus_rigidity_report_sizes(
+                    handle,
+                    target.as_ptr(),
+                    2,
+                    0,
+                    8,
+                    &mut rank,
+                    &mut s,
+                    &mut m_raw,
+                    &mut m,
+                    &mut n_rigid,
+                    &mut particular_len,
+                    &mut residual_len,
+                    &mut self_stress_len,
+                    &mut mechanism_len,
+                    &mut rigid_len,
+                ),
+                0
+            );
+            assert_eq!((rank, s, m_raw, m), (1, 0, 2, 0));
+            assert_eq!((particular_len, residual_len), (1, 3));
+
+            let mut particular = vec![0.0; particular_len];
+            let mut residual = vec![0.0; residual_len];
+            let mut self_stress = vec![0.0; self_stress_len];
+            let mut mechanisms = vec![0.0; mechanism_len];
+            let mut rigid = vec![0.0; rigid_len];
+            let mut residual_ratio = 0.0;
+            assert_eq!(
+                theseus_rigidity_report_fill(
+                    handle,
+                    particular.as_mut_ptr(),
+                    particular.len(),
+                    residual.as_mut_ptr(),
+                    residual.len(),
+                    self_stress.as_mut_ptr(),
+                    self_stress.len(),
+                    mechanisms.as_mut_ptr(),
+                    mechanisms.len(),
+                    rigid.as_mut_ptr(),
+                    rigid.len(),
+                    &mut residual_ratio,
+                ),
+                0
+            );
+            assert!(residual_ratio.is_finite());
+            theseus_free(handle);
+        }
+    }
+
+    #[test]
+    fn retraction_and_prestress_exports_round_trip() {
+        unsafe {
+            let handle = tiny_handle();
+            assert!(!handle.is_null());
+
+            let initial = [1.0, 0.2, 0.0];
+            let target_lengths = [1.0];
+            let mut retracted = [0.0; 3];
+            let mut iterations = 0;
+            let mut converged = false;
+            let mut max_error = 0.0;
+            let mut residual_norm = 0.0;
+            assert_eq!(
+                theseus_retract_member_lengths(
+                    handle,
+                    initial.as_ptr(),
+                    target_lengths.as_ptr(),
+                    30,
+                    1e-12,
+                    retracted.as_mut_ptr(),
+                    &mut iterations,
+                    &mut converged,
+                    &mut max_error,
+                    &mut residual_norm,
+                ),
+                0
+            );
+            assert!(converged);
+            assert!(iterations > 0);
+            assert!(max_error < 1e-10);
+            assert!((retracted[0].hypot(retracted[1]) - 1.0).abs() < 1e-10);
+
+            let target = [1.0, 0.0, 0.0];
+            let prestress = [2.0];
+            let mechanism = [0.0, 1.0, 0.0];
+            let mut eigenvalue = [0.0];
+            let mut class = [0];
+            let mut rotated = [0.0; 3];
+            assert_eq!(
+                theseus_classify_prestress(
+                    handle,
+                    target.as_ptr(),
+                    prestress.as_ptr(),
+                    mechanism.as_ptr(),
+                    1,
+                    1e-12,
+                    eigenvalue.as_mut_ptr(),
+                    class.as_mut_ptr(),
+                    rotated.as_mut_ptr(),
+                ),
+                0
+            );
+            assert_eq!(class[0], 1);
+            assert!((eigenvalue[0] - 2.0).abs() < 1e-10);
+            assert!((rotated[1].abs() - 1.0).abs() < 1e-10);
+
             theseus_free(handle);
         }
     }

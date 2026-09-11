@@ -104,5 +104,7 @@ namespace Ariadne.FDM
         {
             get { return new Guid("4A4E0389-4665-483B-8572-DB19628D1369"); }
         }
+
+        public override GH_Exposure Exposure => GH_Exposure.hidden;
     }
 }

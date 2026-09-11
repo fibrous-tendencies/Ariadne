@@ -67,7 +67,7 @@ public class SelfWeightPrescribedComponent : GH_Component
 
     protected override Bitmap Icon => null!;
     public override Guid ComponentGuid => new("C9D5E4F3-BF60-4CA1-D8E7-4A3F2B5C6D7E");
-    public override GH_Exposure Exposure => GH_Exposure.tertiary;
+    public override GH_Exposure Exposure => GH_Exposure.hidden;
 }
 
 /// <summary>
@@ -139,5 +139,5 @@ public class SelfWeightSizingComponent : GH_Component
 
     protected override Bitmap Icon => null!;
     public override Guid ComponentGuid => new("D0E6F5A4-CA71-4DB2-E9F8-5A4B3C6D7E8F");
-    public override GH_Exposure Exposure => GH_Exposure.tertiary;
+    public override GH_Exposure Exposure => GH_Exposure.hidden;
 }

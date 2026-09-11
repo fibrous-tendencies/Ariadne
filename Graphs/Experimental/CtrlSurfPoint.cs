@@ -341,5 +341,7 @@ namespace Ariadne.GH_Design.Experimental
         {
             get { return new Guid("5C6A252F-A943-46A1-B609-7E80B9DDAD73"); }
         }
+
+        public override GH_Exposure Exposure => GH_Exposure.hidden;
     }
 }

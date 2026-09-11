@@ -340,22 +340,83 @@ internal static class TheseusInterop
 
     // ── Inverse solvers (experimental) ────────────────────────
 
+    /// <summary>
+    /// particular_method: 0 = Gram, 1 = Augmented (Moore–Penrose / Tikhonov),
+    /// 2 = Sparse QR, 3 = Clarabel.
+    /// linear_algebra: 0 = Direct, 1 = Iterative.
+    /// Empty signs / lower / upper (length 0) means unconstrained on that channel.
+    /// </summary>
     [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
-    public static extern int theseus_solve_pseudoinverse(
+    public static extern int theseus_solve_inverse_fdm(
         IntPtr handle,
         double[] target_free_xyz, double regularization,
-        int use_l2, nuint max_l1_iter, int use_augmented, int enforce_zero_rx,
-        int enforce_zero_ry, int enforce_zero_rz, int solve_for_q,
-        double[] out_q, double[] out_xyz, double[] out_lengths,
-        double[] out_forces, double[] out_reactions);
-
-    [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
-    public static extern int theseus_solve_nnls(
-        IntPtr handle,
-        double[] target_free_xyz, nuint max_iter, double tol,
+        int use_l2, nuint max_l1_iter, int particular_method, int linear_algebra,
+        int enforce_zero_rx, int enforce_zero_ry, int enforce_zero_rz, int solve_for_q,
+        int[] signs, nuint n_signs,
+        double[] lower, nuint n_lower,
+        double[] upper, nuint n_upper,
+        nuint max_iter, double tol,
         double[] out_q, double[] out_xyz, double[] out_lengths,
         double[] out_forces, double[] out_reactions,
         ref nuint out_iterations, ref byte out_converged);
+
+    [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int theseus_rigidity_report_sizes(
+        IntPtr handle,
+        double[] target_free_xyz,
+        int method,
+        int include_rigid_bodies,
+        nuint max_modes,
+        ref nuint out_rank,
+        ref nuint out_self_stress_count,
+        ref nuint out_mechanism_raw_count,
+        ref nuint out_mechanism_count,
+        ref nuint out_rigid_count,
+        ref nuint out_particular_len,
+        ref nuint out_residual_len,
+        ref nuint out_self_stress_len,
+        ref nuint out_mechanism_len,
+        ref nuint out_rigid_len);
+
+    [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int theseus_rigidity_report_fill(
+        IntPtr handle,
+        double[] out_particular_t,
+        nuint particular_len,
+        double[] out_residual,
+        nuint residual_len,
+        double[] out_self_stress,
+        nuint self_stress_len,
+        double[] out_mechanisms,
+        nuint mechanism_len,
+        double[] out_rigid_bodies,
+        nuint rigid_len,
+        ref double out_residual_ratio);
+
+    [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int theseus_retract_member_lengths(
+        IntPtr handle,
+        double[] initial_free_xyz,
+        double[] target_lengths,
+        nuint max_iterations,
+        double tolerance,
+        double[] out_free_xyz,
+        ref nuint out_iterations,
+        ref byte out_converged,
+        ref double out_max_length_error,
+        ref double out_residual_norm);
+
+    [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int theseus_classify_prestress(
+        IntPtr handle,
+        double[] target_free_xyz,
+        double[] prestress_t,
+        double[] mechanisms,
+        nuint mechanism_count,
+        double tolerance,
+        double[] out_eigenvalues,
+        int[] out_classes,
+        double[] out_rotated_mechanisms);
 
     /// <summary>
     /// Requests solver cancellation when exported by the native library.

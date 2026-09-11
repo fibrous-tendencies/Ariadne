@@ -110,5 +110,5 @@ public class DirectionalPressureComponent : GH_Component
 
     protected override Bitmap Icon => null!;
     public override Guid ComponentGuid => new("A3B9C8D7-FE04-4AE5-B2C1-8D7E6F9A0B12");
-    public override GH_Exposure Exposure => GH_Exposure.tertiary;
+    public override GH_Exposure Exposure => GH_Exposure.hidden;
 }
