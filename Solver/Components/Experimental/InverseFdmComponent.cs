@@ -41,6 +41,7 @@ public class InverseFdmComponent : GH_Component
         pManager.AddGenericParameter("Network", "Network", "FDM Network (topology + anchors)", GH_ParamAccess.item);
         pManager.AddPointParameter("Target Points", "Target", "Desired free-node positions (one per free node, matching order)", GH_ParamAccess.list);
         pManager.AddVectorParameter("Loads", "Loads", "Loads on free nodes", GH_ParamAccess.list, new Vector3d(0, 0, -1));
+        pManager.AddPointParameter("Load Nodes", "LN", "Nodes to apply loads to (optional; if empty, loads apply to all free nodes)", GH_ParamAccess.list);
         pManager.AddNumberParameter("Regularization", "λ", "Damping used by Tikhonov, Gram, LSQR, Clarabel, and SPG. Ignored for Moore–Penrose and QR. Gram at λ = 0 is unregularized (MᵀM) and may fail if singular.", GH_ParamAccess.item, 1e-6);
         pManager.AddBooleanParameter("L2", "L2", "True = L2 least-squares residual, False = L1 absolute residual (IRLS around the inner solver)", GH_ParamAccess.item, true);
         pManager.AddIntegerParameter("L1 Iterations", "L1Iter", "Maximum IRLS outer iterations when L2 is false", GH_ParamAccess.item, 20);
@@ -59,9 +60,10 @@ public class InverseFdmComponent : GH_Component
             GH_ParamAccess.tree);
         pManager.AddIntegerParameter("Max Iterations", "MaxIter", "Iteration budget per inner solve for SPG and LSQR", GH_ParamAccess.item, 500);
         pManager.AddNumberParameter("Tolerance", "Tol", "Convergence tolerance for SPG and LSQR", GH_ParamAccess.item, 1e-6);
-        pManager[10].Optional = true;
+        pManager[3].Optional = true;
         pManager[11].Optional = true;
         pManager[12].Optional = true;
+        pManager[13].Optional = true;
     }
 
     protected override void RegisterOutputParams(GH_OutputParamManager pManager)
@@ -82,6 +84,7 @@ public class InverseFdmComponent : GH_Component
         FDM_Network? network = null;
         List<Point3d> targetPoints = [];
         List<Vector3d> loads = [];
+        List<Point3d> loadNodes = [];
         double regularization = 1e-6;
         bool useL2 = true;
         int maxL1Iter = 20;
@@ -98,18 +101,19 @@ public class InverseFdmComponent : GH_Component
         if (!DA.GetData(0, ref network)) return;
         if (!DA.GetDataList(1, targetPoints)) return;
         DA.GetDataList(2, loads);
-        DA.GetData(3, ref regularization);
-        DA.GetData(4, ref useL2);
-        DA.GetData(5, ref maxL1Iter);
-        DA.GetData(6, ref enforceZeroRx);
-        DA.GetData(7, ref enforceZeroRy);
-        DA.GetData(8, ref enforceZeroRz);
-        DA.GetData(9, ref solveForQ);
-        DA.GetDataTree(10, out signTree);
-        DA.GetDataTree(11, out lowerTree);
-        DA.GetDataTree(12, out upperTree);
-        DA.GetData(13, ref maxIter);
-        DA.GetData(14, ref tol);
+        DA.GetDataList(3, loadNodes);
+        DA.GetData(4, ref regularization);
+        DA.GetData(5, ref useL2);
+        DA.GetData(6, ref maxL1Iter);
+        DA.GetData(7, ref enforceZeroRx);
+        DA.GetData(8, ref enforceZeroRy);
+        DA.GetData(9, ref enforceZeroRz);
+        DA.GetData(10, ref solveForQ);
+        DA.GetDataTree(11, out signTree);
+        DA.GetDataTree(12, out lowerTree);
+        DA.GetDataTree(13, out upperTree);
+        DA.GetData(14, ref maxIter);
+        DA.GetData(15, ref tol);
 
         _lambda = regularization;
         _useL2 = useL2;
@@ -179,14 +183,18 @@ public class InverseFdmComponent : GH_Component
         foreach (var edge in network.Graph.Edges)
             q.Add(double.IsFinite(edge.Q) ? edge.Q : 1.0);
 
-        var inputs = new SolverInputs
-        {
-            QInit = q,
-            Loads = loads,
-        };
-
         try
         {
+            var loadNodeIndices = loadNodes.Count > 0
+                ? TheseusSolverService.ResolveLoadNodeIndices(network, loadNodes)
+                : null;
+            var inputs = new SolverInputs
+            {
+                QInit = q,
+                Loads = loads,
+                LoadNodeIndices = loadNodeIndices,
+            };
+
             double effectiveRegularization = unconstrainedDirect
                 ? _particular switch
                 {
@@ -210,7 +218,10 @@ public class InverseFdmComponent : GH_Component
                     $"SPG did not converge in {result.Iterations} iterations.");
             }
 
-            var (forces, residuals, ratio) = TargetResidual(network, targetPoints, loads, result.ForceDensities);
+            var packedLoads = TheseusSolverService.PackFreeNodeLoads(
+                network.FreeNodes.Count, loads, loadNodeIndices);
+            var (forces, residuals, ratio) = TargetResidual(
+                network, targetPoints, packedLoads, result.ForceDensities);
 
             DA.SetData(0, result.Network);
             DA.SetDataList(1, result.NodePositions);
@@ -281,7 +292,7 @@ public class InverseFdmComponent : GH_Component
     }
 
     private static (double[] Forces, Vector3d[] Residuals, double Ratio) TargetResidual(
-        FDM_Network network, IReadOnlyList<Point3d> target, IReadOnlyList<Vector3d> loads,
+        FDM_Network network, IReadOnlyList<Point3d> target, IReadOnlyList<Vector3d> packedLoads,
         IReadOnlyList<double> q)
     {
         var positions = new Point3d[network.Graph.Nn];
@@ -291,7 +302,7 @@ public class InverseFdmComponent : GH_Component
             positions[network.FixedNodes[i]] = network.Fixed[i].Value;
         var residuals = new Vector3d[network.FreeNodes.Count];
         for (int i = 0; i < residuals.Length; i++)
-            residuals[i] = -(loads.Count == 1 ? loads[0] : loads[Math.Min(i, loads.Count - 1)]);
+            residuals[i] = -packedLoads[i];
         var freeLookup = new Dictionary<int, int>();
         for (int i = 0; i < network.FreeNodes.Count; i++) freeLookup[network.FreeNodes[i]] = i;
         var forces = new double[network.Graph.Ne];
@@ -309,8 +320,7 @@ public class InverseFdmComponent : GH_Component
         for (int i = 0; i < residuals.Length; i++)
         {
             residualNorm += residuals[i].SquareLength;
-            Vector3d load = loads.Count == 1 ? loads[0] : loads[Math.Min(i, loads.Count - 1)];
-            loadNorm += load.SquareLength;
+            loadNorm += packedLoads[i].SquareLength;
         }
         return (forces, residuals, Math.Sqrt(residualNorm) / Math.Max(Math.Sqrt(loadNorm), double.Epsilon));
     }
@@ -485,6 +495,9 @@ each SPG or LSQR inner solve.
 
 <h2>Input wires</h2>
 <ul>
+<li><b>Loads / Load Nodes</b> — with no Load Nodes, loads apply to all free nodes in order
+(the last load repeats if needed). With Load Nodes, one load broadcasts to every listed node,
+or provide one load per listed node; unlisted free nodes receive zero load.</li>
 <li><b>SolveQ</b> — True solves for force densities <code>q</code>. False solves for member forces
 <code>t</code>, then recovers <code>q = t / L</code>.</li>
 <li><b>Rx0 / Ry0 / Rz0</b> — independently force zero support reaction in X, Y, and/or Z.</li>

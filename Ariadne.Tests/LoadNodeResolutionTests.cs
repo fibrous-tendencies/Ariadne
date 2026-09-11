@@ -58,6 +58,58 @@ public sealed class LoadNodeResolutionTests
         Assert.Contains("0.01", exception.Message);
     }
 
+    [Fact]
+    public void BroadcastsSingleLoadToSpecifiedNodesAndZerosOthers()
+    {
+        var load = new Vector3d(1, 2, 3);
+
+        var packed = TheseusSolverService.PackFreeNodeLoads(4, [load], [1, 3]);
+
+        Assert.Equal(
+            [Vector3d.Zero, load, Vector3d.Zero, load],
+            packed);
+    }
+
+    [Fact]
+    public void AppliesMatchingLoadsToSpecifiedNodesInOrder()
+    {
+        var first = new Vector3d(1, 0, 0);
+        var second = new Vector3d(0, 2, 0);
+
+        var packed = TheseusSolverService.PackFreeNodeLoads(
+            3, [first, second], [2, 0]);
+
+        Assert.Equal(
+            [second, Vector3d.Zero, first],
+            packed);
+    }
+
+    [Fact]
+    public void RepeatsLastLoadAcrossAllNodesWhenNoLoadNodesAreSpecified()
+    {
+        var first = new Vector3d(1, 0, 0);
+        var second = new Vector3d(0, 2, 0);
+
+        var packed = TheseusSolverService.PackFreeNodeLoads(
+            4, [first, second], null);
+
+        Assert.Equal(
+            [first, second, second, second],
+            packed);
+    }
+
+    [Fact]
+    public void RejectsMismatchedLoadAndLoadNodeCounts()
+    {
+        var exception = Assert.Throws<ArgumentException>(
+            () => TheseusSolverService.PackFreeNodeLoads(
+                4,
+                [new Vector3d(1, 0, 0), new Vector3d(0, 1, 0)],
+                [0, 1, 2]));
+
+        Assert.Contains("provide either 1 load or exactly 3 loads", exception.Message);
+    }
+
     private static FDM_Network Network(double tolerance, params Point3d[] points)
     {
         var nodes = new List<Node>(points.Length);

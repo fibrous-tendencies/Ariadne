@@ -321,6 +321,41 @@ public static class TheseusSolverService
         return indices;
     }
 
+    internal static Vector3d[] PackFreeNodeLoads(
+        int numFree,
+        IReadOnlyList<Vector3d> loads,
+        IReadOnlyList<int>? loadNodeIndices)
+    {
+        if (loads.Count == 0)
+            throw new ArgumentException("Loads list cannot be empty.", nameof(loads));
+
+        var packed = new Vector3d[numFree];
+        if (loadNodeIndices is { Count: > 0 } targetIndices)
+        {
+            if (loads.Count != 1 && loads.Count != targetIndices.Count)
+                throw new ArgumentException(
+                    $"When load nodes are specified ({targetIndices.Count}), " +
+                    $"provide either 1 load or exactly {targetIndices.Count} loads (got {loads.Count}).");
+
+            for (int i = 0; i < targetIndices.Count; i++)
+            {
+                int freeIdx = targetIndices[i];
+                if ((uint)freeIdx >= (uint)numFree)
+                    throw new ArgumentOutOfRangeException(
+                        nameof(loadNodeIndices),
+                        $"Load node index {freeIdx} is outside the free-node range [0, {numFree}).");
+                packed[freeIdx] = loads.Count == 1 ? loads[0] : loads[i];
+            }
+        }
+        else
+        {
+            for (int i = 0; i < numFree; i++)
+                packed[i] = i < loads.Count ? loads[i] : loads[^1];
+        }
+
+        return packed;
+    }
+
     #region Validation
 
     private static void ValidateCommon(FDM_Network network, SolverInputs inputs)
@@ -423,32 +458,13 @@ public static class TheseusSolverService
             cooVals[e * 2 + 1] = 1.0;
         }
 
+        var packedLoads = PackFreeNodeLoads(numFree, inputs.Loads, inputs.LoadNodeIndices);
         double[] loads = new double[numFree * 3];
-        if (inputs.LoadNodeIndices is { Count: > 0 } targetIndices)
+        for (int i = 0; i < numFree; i++)
         {
-            if (inputs.Loads.Count != 1 && inputs.Loads.Count != targetIndices.Count)
-                throw new ArgumentException(
-                    $"When load nodes are specified ({targetIndices.Count}), " +
-                    $"provide either 1 load or exactly {targetIndices.Count} loads (got {inputs.Loads.Count}).");
-
-            for (int i = 0; i < targetIndices.Count; i++)
-            {
-                int freeIdx = targetIndices[i];
-                var load = inputs.Loads.Count == 1 ? inputs.Loads[0] : inputs.Loads[i];
-                loads[freeIdx * 3 + 0] = load.X;
-                loads[freeIdx * 3 + 1] = load.Y;
-                loads[freeIdx * 3 + 2] = load.Z;
-            }
-        }
-        else
-        {
-            for (int i = 0; i < numFree; i++)
-            {
-                var load = i < inputs.Loads.Count ? inputs.Loads[i] : inputs.Loads[^1];
-                loads[i * 3 + 0] = load.X;
-                loads[i * 3 + 1] = load.Y;
-                loads[i * 3 + 2] = load.Z;
-            }
+            loads[i * 3 + 0] = packedLoads[i].X;
+            loads[i * 3 + 1] = packedLoads[i].Y;
+            loads[i * 3 + 2] = packedLoads[i].Z;
         }
 
         double[] fixedPos = new double[numFixed * 3];
