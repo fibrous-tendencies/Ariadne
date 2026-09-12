@@ -27,14 +27,14 @@ public class InverseFdmComponent : GH_Component
     private MetricMode _metric = InverseFdmUiState.DefaultMetric;
     private double _lambda = 1e-6;
     private double _cwlsDamping = 1e-6;
+    private int _frozenIterations = InverseFdmUiState.DefaultFrozenIterations;
     private int _gnIterations = InverseFdmUiState.DefaultGnIterations;
-    private bool _useL2 = true;
     private bool _solveForQ = InverseFdmUiState.DefaultSolveForQ;
     private bool _hasBox;
 
     public InverseFdmComponent()
         : base("Inverse FDM", "InvFDM",
-            "Find one equilibrium particular at a target geometry, then forward-solve.",
+            "Build a q warm start from a target particular, optional frozen CWLS, and optional CWLS-GN, then forward-solve.",
             "Ariadne", "Experimental")
     {
         UpdateMessage();
@@ -47,8 +47,8 @@ public class InverseFdmComponent : GH_Component
         pManager.AddVectorParameter("Loads", "Loads", "Loads on free nodes", GH_ParamAccess.list, new Vector3d(0, 0, -1));
         pManager.AddPointParameter("Load Nodes", "LN", "Nodes to apply loads to (optional; if empty, loads apply to all free nodes)", GH_ParamAccess.list);
         pManager.AddNumberParameter("Regularization", "λ", "Stage-1 particular regularization used by Tikhonov, Gram, LSQR, Clarabel, and SPG. Ignored for Moore–Penrose and QR.", GH_ParamAccess.item, 1e-6);
-        pManager.AddBooleanParameter("L2", "L2", "True = L2 least-squares residual, False = L1 absolute residual (IRLS around the inner solver)", GH_ParamAccess.item, true);
-        pManager.AddIntegerParameter("Gauss–Newton Iterations", "GNiter", "Geometric metric only: 0 runs one frozen-target CWLS update; a positive value is the maximum number of CWLS-GN updates. Stops early at Tol.", GH_ParamAccess.item, InverseFdmUiState.DefaultGnIterations);
+        pManager.AddIntegerParameter("Frozen CWLS Iterations", "FrozenIter", "Geometric metric only: maximum frozen-target CWLS updates before Gauss–Newton. 0 skips this phase.", GH_ParamAccess.item, InverseFdmUiState.DefaultFrozenIterations);
+        pManager.AddIntegerParameter("Gauss–Newton Iterations", "GNiter", "Geometric metric only: maximum CWLS-GN updates after the frozen phase. 0 skips this phase. Stops early at Tol.", GH_ParamAccess.item, InverseFdmUiState.DefaultGnIterations);
         pManager.AddBooleanParameter("Enforce Rx=0", "Rx0", "Strictly enforce zero X-reaction at supports", GH_ParamAccess.item, false);
         pManager.AddBooleanParameter("Enforce Ry=0", "Ry0", "Strictly enforce zero Y-reaction at supports", GH_ParamAccess.item, false);
         pManager.AddBooleanParameter("Enforce Rz=0", "Rz0", "Strictly enforce zero Z-reaction at supports", GH_ParamAccess.item, false);
@@ -94,8 +94,8 @@ public class InverseFdmComponent : GH_Component
         List<Vector3d> loads = [];
         List<Point3d> loadNodes = [];
         double regularization = 1e-6;
-        bool useL2 = true;
         const int maxL1Iter = 20;
+        int frozenIterations = InverseFdmUiState.DefaultFrozenIterations;
         int gnIterations = InverseFdmUiState.DefaultGnIterations;
         bool enforceZeroRx = false;
         bool enforceZeroRy = false;
@@ -113,7 +113,7 @@ public class InverseFdmComponent : GH_Component
         DA.GetDataList(2, loads);
         DA.GetDataList(3, loadNodes);
         DA.GetData(4, ref regularization);
-        DA.GetData(5, ref useL2);
+        DA.GetData(5, ref frozenIterations);
         DA.GetData(6, ref gnIterations);
         DA.GetData(7, ref enforceZeroRx);
         DA.GetData(8, ref enforceZeroRy);
@@ -128,8 +128,8 @@ public class InverseFdmComponent : GH_Component
 
         _lambda = regularization;
         _cwlsDamping = cwlsDamping;
+        _frozenIterations = Math.Max(0, frozenIterations);
         _gnIterations = Math.Max(0, gnIterations);
-        _useL2 = useL2;
         _solveForQ = solveForQ;
 
         if (network == null || !network.Valid)
@@ -186,13 +186,6 @@ public class InverseFdmComponent : GH_Component
 
         if (_metric == MetricMode.Geometric)
         {
-            if (!useL2)
-            {
-                AddRuntimeMessage(GH_RuntimeMessageLevel.Error,
-                    "The geometric metric requires L2 = true. IRLS reweights the force residual, which "
-                    + "has no agreed meaning once the rows carry the Laplacian compliance.");
-                return;
-            }
             if (!InverseFdmUiState.HasStrictSignDefiniteBounds(lower, upper))
             {
                 AddRuntimeMessage(GH_RuntimeMessageLevel.Warning,
@@ -237,14 +230,15 @@ public class InverseFdmComponent : GH_Component
                 : regularization;
             int particularMethod = InverseFdmUiState.NativeParticularMethod(_particular);
 
-            int nativeMetric = InverseFdmUiState.NativeMetric(_metric, _gnIterations);
-            int maxOuter = InverseFdmUiState.GeometricIterationBudget(_metric, _gnIterations);
+            int nativeMetric = InverseFdmUiState.NativeMetric(_metric);
+            int frozenBudget = InverseFdmUiState.FrozenIterationBudget(_metric, _frozenIterations);
+            int gnBudget = InverseFdmUiState.GaussNewtonIterationBudget(_metric, _gnIterations);
             var result = TheseusSolverService.SolveInverseFdm(
                 network, inputs, targetFreeXyz, effectiveRegularization,
-                useL2, maxL1Iter, particularMethod, (int)_linearAlgebra,
+                true, maxL1Iter, particularMethod, (int)_linearAlgebra,
                 enforceZeroRx, enforceZeroRy, enforceZeroRz, solveForQ,
                 [.. signs], [.. lower], [.. upper], maxIter, tol,
-                nativeMetric, maxOuter, cwlsDamping);
+                nativeMetric, gnBudget, cwlsDamping, frozenBudget);
 
             if (_metric == MetricMode.Force
                 && _hasBox
@@ -441,7 +435,6 @@ public class InverseFdmComponent : GH_Component
 
     private void UpdateMessage()
     {
-        string residual = _useL2 ? "L2" : "L1";
         string unknown = _solveForQ ? "q-init" : "t-init";
         ActiveInverseEngine engine = InverseFdmUiState.ResolveEngine(
             _linearAlgebra, _particular, _hasBox);
@@ -456,15 +449,10 @@ public class InverseFdmComponent : GH_Component
             ActiveInverseEngine.Lsqr => $"LSQR λ={FormatLambda(_lambda)}",
             _ => $"SPG λ={FormatLambda(_lambda)}",
         };
-        string metricLabel = _metric switch
-        {
-            MetricMode.Geometric when _gnIterations == 0 =>
-                $" · CWLS λ={FormatLambda(_cwlsDamping)}",
-            MetricMode.Geometric =>
-                $" · CWLS-GN×{_gnIterations} λ={FormatLambda(_cwlsDamping)}",
-            _ => "",
-        };
-        Message = $"{engineLabel} · {residual} · {unknown}{metricLabel}";
+        string metricLabel = _metric == MetricMode.Geometric
+            ? $" · {InverseFdmUiState.PhaseLabel(_frozenIterations, _gnIterations)} λ={FormatLambda(_cwlsDamping)}"
+            : "";
+        Message = $"{engineLabel} · L2 · {unknown}{metricLabel}";
     }
 
     private static string FormatLambda(double lambda)
@@ -499,163 +487,155 @@ public class InverseFdmComponent : GH_Component
 <body>
 <h1>Inverse FDM</h1>
 <p>
-This component solves a <b>rectangular</b> equilibrium system at a prescribed
-target geometry, then runs a forward FDM solve with the recovered force densities.
-It is <b>not</b> the inverse of the square form-finding matrix <code>A(q)</code>.
-(The older name was Pinv.)
-</p>
-
-<br/>
-
-<h2>When to bound the particular</h2>
-<p>
-A flat or nearly-flat plate cannot carry out-of-plane load with in-plane members.
-Unconstrained least squares can then produce huge <code>q</code> or <code>t</code>.
-<b>Signs</b>, <b>Lower</b>, and <b>Upper</b> always constrain force density q.
-When Stage 1 solves member force, the component transforms the q box with
-<code>t = L* q</code>. RelRes will not go to 0 when the target is inconsistent
-with the box.
+This component constructs a force-density warm start for a prescribed target
+geometry <code>x*</code>, then forward-solves the network with the recovered
+<code>q</code>. The pipeline is:
 </p>
 <p>
-These bounds clip the least-squares particular. They are <b>not</b> the
-length-preserving transform's sign cone, which stays in equilibrium by adding
-self-stress.
-</p>
-
-<br/>
-
-<h2>Metric (right-click)</h2>
-<p>
-Choosing what to minimise matters more than choosing a solver. In FDM the force
-residual in the free-node rows at a frozen target is the geometric error
-pre-conditioned by the Laplacian:
+<b>Stage-1 particular → Frozen CWLS → CWLS-GN → forward FDM.</b>
 </p>
 <p>
-<code>r(q) = E(x*)q − p = D(q)(x* − x(q))</code>, so
-<code>x(q) − x* = −D(q)⁻¹ r(q)</code>.
+The two CWLS phases are optional and independently budgeted. This is an inverse
+equilibrium solve at a frozen geometry, not an algebraic inverse of the square
+forward matrix <code>D(q)</code>.
+</p>
+
+<h2>Stage 1: equilibrium particular</h2>
+<p>
+At <code>x*</code>, Stage 1 solves a rectangular linear least-squares problem
+for one equilibrium particular. <b>SolveQ = false</b> (default) solves member
+forces <code>t</code> using target unit directions, then converts
+<code>q = t/L*</code>. <b>SolveQ = true</b> solves force densities directly.
+The choice affects only this initializer; all CWLS updates use q.
 </p>
 <ul>
-<li><b>Force residual</b> — returns the selected Stage-1 particular without a
-compliance-weighted update. It minimises <code>‖r‖</code>. Every nodal
-force error counts the same regardless of how flexible that node is, so a small
-RelRes can still forward-solve far from the target. This is the historical
-behaviour and the right choice for a rigidity/particular question.</li>
-<li><b>Geometric residual (default)</b> — applies compliance-weighted
-least-squares (CWLS) warm-start updates in q. <b>GNiter = 0</b> performs one
-frozen-target update with the Jacobian held at <code>x*</code>. A positive
-<b>GNiter</b> performs up to that many Gauss–Newton updates, rebuilding the
-Jacobian at <code>x(q_k)</code> and stopping early at Tol. These are true
-Gauss–Newton steps for <code>‖x(q) − x*‖</code> and need no forward solve because
-<code>x(q_k) = x* − D⁻¹r_k</code>.</li>
+<li><b>Clarabel (default)</b> — convex quadratic least squares with optional
+q bounds and reaction equalities.</li>
+<li><b>Moore–Penrose</b> — augmented saddle solve at λ = 0 for a minimum-norm
+unconstrained particular.</li>
+<li><b>Tikhonov</b> — solves
+<code>min ½‖Mz−p‖² + ½λ‖z‖²</code>; λ must be positive.</li>
+<li><b>QR least squares</b> — sparse QR for tall, full-column-rank systems;
+rank-deficient or wide systems report an error.</li>
+<li><b>Gram</b> — solves
+<code>(MᵀM + λI)z = Mᵀp</code>; it may be less well-conditioned than QR or
+the augmented formulations.</li>
 </ul>
 <p>
-Use a geometric metric when you want a <b>warm start</b>: a q whose form-found
-shape lands near the target. Use Force when you want the particular that best
-closes equilibrium at the frozen shape.
-</p>
-<p>
-CWLS requires <b>L2 = true</b>, geometry-independent loads, and nonsingular
-<code>D(q)</code>. Positive q guarantees a positive-definite Laplacian on a
-properly anchored connected net. Mixed-sign and all-compression q are supported
-with sparse LDLᵀ when D is nonsingular and numerically factorizable under the
-current ordering; indefiniteness itself is not an error.
-Gram and QR may generate Stage 1, while Stage 2 independently selects a
-left-weightable backend.
-</p>
-<p>
-<b>Regularization λ</b> applies only to the Stage-1 particular.
-<b>CWLS Damping λcwls</b> applies Levenberg–Marquardt damping
-<code>λcwls‖Δq‖²</code> to Stage 2. The geometric objective is nonconvex even
-though each inner CWLS problem is convex. <b>GeomErr</b> reports
-<code>‖x(q) − x*‖</code> for every metric.
+With <b>Iterative</b> linear algebra, unconstrained problems use LSQR and
+bounded problems use SPG. <b>MaxIter</b> is the per-inner-solve iteration
+budget for Clarabel, LSQR, and SPG; it is not a CWLS phase budget.
 </p>
 
-<br/>
-
-<h2>Linear algebra (right-click)</h2>
+<h2>Metric and compliance weighting</h2>
 <p>
-The particular and linear-algebra menus select Stage 1. Stage 2 always works
-in q and dispatches independently.
+For target equilibrium matrix <code>E(x*)</code>, target residual
+<code>r(q) = E(x*)q − p</code>, and free-node FDM Laplacian
+<code>D(q) = C_fᵀ diag(q) C_f</code> (applied to each coordinate), the exact
+constant-load identity is
+</p>
+<p>
+<code>r(q) = D(q)(x* − x(q))</code>, hence
+<code>x(q) − x* = −D(q)⁻¹r(q)</code>.
 </p>
 <ul>
-<li><b>Direct</b> — uses the selected Direct solver when unconstrained.
-A nonzero Sign or finite q bound selects Clarabel. Bounded CWLS also uses
-Clarabel; unbounded CWLS uses the weighted saddle system.</li>
-<li><b>Iterative</b> — uses LSQR when unconstrained and SPG with a nonzero Sign
-or finite q bound, in both stages. The Direct solver menu is inactive.</li>
+<li><b>Force residual</b> — returns Stage 1 directly and minimises the Euclidean
+equilibrium residual. CWLS budgets are ignored.</li>
+<li><b>Geometric residual (default)</b> — runs the requested compliance-weighted
+phases in q. Set both phase budgets to zero to inspect Stage 1 alone.</li>
 </ul>
 <p>
-Connected ±∞ bounds do not constrain the solve.
+All residual objectives in this component are L2. The former L2/L1 toggle and
+its IRLS approximation were removed because IRLS was not an exact bounded L1
+solve and has no consistent role in compliance-weighted CWLS.
 </p>
 
-<br/>
+<h2>Frozen CWLS phase</h2>
+<p>
+At iteration <code>q_k</code>, Frozen CWLS rebuilds the compliance
+<code>D(q_k)⁻¹</code> but keeps the target Jacobian <code>E(x*)</code>. Its
+step is the bounded convex least-squares model
+</p>
+<p>
+<code>min_Δq ½‖D(q_k)⁻¹(r(q_k)+E(x*)Δq)‖²
++ ½λcwls‖Δq‖²</code>.
+</p>
+<p>
+This is useful as compliance reweighting of the Stage-1 particular, but it is
+not the exact Jacobian of the nonlinear landing map away from the target.
+<b>FrozenIter</b> sets its maximum accepted-step attempts; 0 skips it.
+</p>
 
-<h2>Direct solvers</h2>
+<h2>Gauss–Newton CWLS phase</h2>
+<p>
+After Frozen CWLS, Gauss–Newton rebuilds both <code>D(q_k)</code> and the
+Jacobian <code>E(x(q_k))</code>. For geometry-independent loads,
+<code>−D(q_k)⁻¹E(x(q_k))</code> is the derivative of the forward coordinates
+with respect to q, so the CWLS-GN step is a true Gauss–Newton model of
+<code>½‖x(q)−x*‖²</code>. <b>GNiter</b> sets its maximum; 0 skips it.
+</p>
+<p>
+Both phases backtrack against the exact <b>GeomErr</b>, accept only improving
+trials, stop early at Tol, and retain the best point across the whole sequence.
+Thus a GN phase cannot replace a better frozen result. λcwls is q-space
+Levenberg–Marquardt damping; it does not regularize or shift <code>D(q)</code>.
+</p>
+
+<h2>Phase controls</h2>
 <ul>
-<li><b>Clarabel (default)</b> — QP least squares, with or without bounds. Uses λ.</li>
-<li><b>Moore–Penrose</b> — augmented saddle at λ = 0. Min-norm particular
-<code>x = M⁺ p</code>. The λ wire is unused.</li>
-<li><b>Tikhonov</b> — damped saddle using the λ wire (λ must be &gt; 0).
-<code>min ‖Mx − p‖² + λ‖x‖²</code>.</li>
-<li><b>QR least squares</b> — COLAMD sparse QR for tall, full-column-rank systems.
-Rank-deficient or wide nets error instead of guessing a particular. λ is unused.
-L2 = false wraps QR in IRLS.</li>
-<li><b>Gram (normal equations)</b> — <code>(MᵀM + λI)x = Mᵀp</code>. λ is used as-is,
-including 0 (pure <code>MᵀM</code>, which fails if singular).</li>
+<li><b>FrozenIter = 0, GNiter = 3</b> — default, Gauss–Newton only.</li>
+<li><b>FrozenIter = 3, GNiter = 0</b> — frozen-target CWLS only.</li>
+<li><b>FrozenIter = 1, GNiter = 0</b> — one compliance reweight.</li>
+<li><b>FrozenIter = 3, GNiter = 3</b> — frozen warm-up followed by GN.</li>
+<li><b>FrozenIter = 0, GNiter = 0</b> — Stage 1 only.</li>
 </ul>
-
 <p>
-Iterative λ = 0 uses LSQR for a minimum-norm solution; λ &gt; 0 uses regularized LSQR.
-Bounded Iterative uses SPG and λ.
+Budgets are nonnegative and have no hard upper cap. Tol stops a phase when
+GeomErr is small, or when both relative improvement and relative q-step are
+small. Frozen-phase stagnation does not prevent the requested GN phase from
+trying its different Jacobian.
+</p>
+<p>
+Migration note: the former experimental <b>L2</b> input slot is now
+<b>FrozenIter</b>. Remove any old Boolean wire and supply a nonnegative integer.
 </p>
 
-<br/>
-
-<h2>L1 / IRLS</h2>
+<h2>Bounds, signs, and invertibility</h2>
 <p>
-For the Force metric, <code>L2 = false</code> wraps the Stage-1 inner solver in
-iteratively reweighted least squares with an internal iteration budget. That is
-still weighted L2, not a linear program. Bound + IRLS is not exact ℓ₁ with
-bounds. The Geometric metric requires <code>L2 = true</code>.
+<b>Signs</b>, <b>Lower</b>, and <b>Upper</b> always constrain q in every stage.
+When Stage 1 solves t, the component maps the q box through
+<code>t = L* q</code> using positive target lengths. One value broadcasts;
+otherwise data must match the edge tree. Empty channels are unconstrained.
+</p>
+<p>
+Positive q gives a positive-definite D for a connected, properly anchored net.
+Mixed-sign and all-compression systems use sparse LDLᵀ and are valid only when
+D is nonsingular and numerically factorizable. Near-zero q and sign cancellation
+can create mechanisms or failed trial factors. The solver deliberately uses the
+exact compliance: no shifted inverse or pseudoinverse is substituted.
 </p>
 
-<br/>
-
-<h2>Input wires</h2>
+<h2>Other inputs</h2>
 <ul>
-<li><b>Loads / Load Nodes</b> — with no Load Nodes, loads apply to all free nodes in order
-(the last load repeats if needed). With Load Nodes, one load broadcasts to every listed node,
-or provide one load per listed node; unlisted free nodes receive zero load.</li>
-<li><b>Rx0 / Ry0 / Rz0</b> — independently force zero support reaction in X, Y, and/or Z.</li>
-<li><b>GNiter</b> — Geometric metric only. 0 runs one frozen-target CWLS update.
-A positive integer runs at most that many CWLS-GN updates; Tol may stop them
-earlier. The default is 3. Force ignores this input.</li>
-<li><b>SolveQ</b> — controls Stage 1 only. False (default) solves member forces
-<code>t</code> using unit directions and converts <code>q=t/L*</code>; True
-solves the initial particular directly in q. CWLS and downstream L-BFGS-B
-always operate in q.</li>
-<li><b>Signs / Lower / Upper</b> — always constrain q. A force-space Stage 1
-multiplies the bounds by positive target edge lengths. Match or graft to the
-edge tree: one value broadcasts globally or within a branch, or provide one
-value per edge. Empty channels are unconstrained. Older experimental files that
-treated these values as force bounds must divide them by target lengths.</li>
-<li><b>MaxIter</b> — inner iteration budget for Clarabel, SPG, and LSQR.
-It is independent of GNiter.</li>
-<li><b>Tol</b> — inner-solver tolerance and early stopping tolerance for CWLS-GN.</li>
+<li><b>Loads / Load Nodes</b> — without Load Nodes, loads apply to free nodes
+in order and the final load repeats. With Load Nodes, one load broadcasts or
+one load per listed node is required; unlisted free nodes receive zero.</li>
+<li><b>Rx0 / Ry0 / Rz0</b> — add exact linear zero-reaction constraints to the
+particular and CWLS subproblems.</li>
+<li><b>Regularization λ</b> — Stage 1 only.</li>
+<li><b>CWLS Damping λcwls</b> — both geometric phases only.</li>
+<li><b>MaxIter</b> — each inner Clarabel, SPG, or LSQR solve. Independent of
+FrozenIter and GNiter.</li>
+<li><b>Tol</b> — inner-solver tolerance and geometric phase stopping tolerance.</li>
 </ul>
-
-<br/>
 
 <h2>Outputs</h2>
 <p>
-<b>Network / Nodes / Edges</b> come from the forward solve. <b>Forces / Residual / RelRes</b>
-are evaluated at the target geometry for the recovered particular.
-</p>
-<p>
-<b>GeomErr</b> is <code>‖x(q) − x*‖</code>, the distance from the forward-solved
-geometry to the target. It is a length, not a ratio, and it is the quantity a
-warm start should be judged on. RelRes near zero does <i>not</i> imply GeomErr
-near zero when the target is not funicular.
+<b>Network / Nodes / Edges</b> are the final forward solve.
+<b>Forces / Residual / RelRes</b> are evaluated at x* using the returned q.
+<b>GeomErr = ‖x(q)−x*‖</b> is a length and directly measures warm-start landing
+error. A small force residual ratio does not imply a small GeomErr when the
+target is not funicular.
 </p>
 </body>
 </html>
@@ -701,19 +681,31 @@ internal static class InverseFdmUiState
 {
     internal const ParticularMode DefaultParticular = ParticularMode.Clarabel;
     internal const MetricMode DefaultMetric = MetricMode.Geometric;
+    internal const int DefaultFrozenIterations = 0;
     internal const int DefaultGnIterations = 3;
     internal const bool DefaultSolveForQ = false;
 
-    internal static int NativeMetric(MetricMode metric, int gnIterations) =>
-        metric switch
-        {
-            MetricMode.Force => 0,
-            _ when gnIterations <= 0 => 1,
-            _ => 2,
-        };
+    internal static int NativeMetric(MetricMode metric) =>
+        metric == MetricMode.Force ? 0 : 2;
 
-    internal static int GeometricIterationBudget(MetricMode metric, int gnIterations) =>
-        metric == MetricMode.Force ? 0 : Math.Max(1, gnIterations);
+    internal static int FrozenIterationBudget(MetricMode metric, int frozenIterations) =>
+        metric == MetricMode.Force ? 0 : Math.Max(0, frozenIterations);
+
+    internal static int GaussNewtonIterationBudget(MetricMode metric, int gnIterations) =>
+        metric == MetricMode.Force ? 0 : Math.Max(0, gnIterations);
+
+    internal static string PhaseLabel(int frozenIterations, int gnIterations)
+    {
+        int frozen = Math.Max(0, frozenIterations);
+        int gn = Math.Max(0, gnIterations);
+        if (frozen == 0 && gn == 0)
+            return "Stage 1 only";
+        if (frozen == 0)
+            return $"GN×{gn}";
+        if (gn == 0)
+            return $"Frozen×{frozen}";
+        return $"Frozen×{frozen} → GN×{gn}";
+    }
 
     internal static bool HasEffectiveBounds(
         IReadOnlyList<int> signs,

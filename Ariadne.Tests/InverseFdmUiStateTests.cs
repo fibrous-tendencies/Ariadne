@@ -10,6 +10,7 @@ public sealed class InverseFdmUiStateTests
     {
         Assert.Equal(ParticularMode.Clarabel, InverseFdmUiState.DefaultParticular);
         Assert.Equal(MetricMode.Geometric, InverseFdmUiState.DefaultMetric);
+        Assert.Equal(0, InverseFdmUiState.DefaultFrozenIterations);
         Assert.Equal(3, InverseFdmUiState.DefaultGnIterations);
         Assert.False(InverseFdmUiState.DefaultSolveForQ);
         Assert.Equal(3, InverseFdmUiState.NativeParticularMethod(ParticularMode.Clarabel));
@@ -157,17 +158,26 @@ public sealed class InverseFdmUiStateTests
     }
 
     [Fact]
-    public void GnIterationsSelectNativeMetricAndBudget()
+    public void GeometricPhaseBudgetsAreIndependentAndNonnegative()
     {
-        Assert.Equal(0, InverseFdmUiState.NativeMetric(MetricMode.Force, 3));
-        Assert.Equal(1, InverseFdmUiState.NativeMetric(MetricMode.Geometric, 0));
-        Assert.Equal(1, InverseFdmUiState.NativeMetric(MetricMode.Geometric, -1));
-        Assert.Equal(2, InverseFdmUiState.NativeMetric(MetricMode.Geometric, 1));
-        Assert.Equal(2, InverseFdmUiState.NativeMetric(MetricMode.Geometric, 500));
+        Assert.Equal(0, InverseFdmUiState.NativeMetric(MetricMode.Force));
+        Assert.Equal(2, InverseFdmUiState.NativeMetric(MetricMode.Geometric));
 
-        Assert.Equal(0, InverseFdmUiState.GeometricIterationBudget(MetricMode.Force, 3));
-        Assert.Equal(1, InverseFdmUiState.GeometricIterationBudget(MetricMode.Geometric, 0));
-        Assert.Equal(1, InverseFdmUiState.GeometricIterationBudget(MetricMode.Geometric, -1));
-        Assert.Equal(500, InverseFdmUiState.GeometricIterationBudget(MetricMode.Geometric, 500));
+        Assert.Equal(0, InverseFdmUiState.FrozenIterationBudget(MetricMode.Force, 12));
+        Assert.Equal(0, InverseFdmUiState.GaussNewtonIterationBudget(MetricMode.Force, 12));
+        Assert.Equal(0, InverseFdmUiState.FrozenIterationBudget(MetricMode.Geometric, -1));
+        Assert.Equal(0, InverseFdmUiState.GaussNewtonIterationBudget(MetricMode.Geometric, -1));
+        Assert.Equal(7, InverseFdmUiState.FrozenIterationBudget(MetricMode.Geometric, 7));
+        Assert.Equal(500, InverseFdmUiState.GaussNewtonIterationBudget(MetricMode.Geometric, 500));
+    }
+
+    [Theory]
+    [InlineData(0, 0, "Stage 1 only")]
+    [InlineData(3, 0, "Frozen×3")]
+    [InlineData(0, 3, "GN×3")]
+    [InlineData(3, 3, "Frozen×3 → GN×3")]
+    public void PhaseLabelReportsActualPipeline(int frozen, int gn, string expected)
+    {
+        Assert.Equal(expected, InverseFdmUiState.PhaseLabel(frozen, gn));
     }
 }

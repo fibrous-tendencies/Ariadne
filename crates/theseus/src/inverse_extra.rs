@@ -1321,12 +1321,75 @@ pub fn solve_inverse_fdm(
             opts.enforce_zero_rz,
         )?;
         let stage2_kind = pick_stage2_inner(&opts, &q_bounds);
+        let (frozen_budget, newton_budget) = match opts.metric {
+            InverseMetric::Force => unreachable!("force metric is not geometric"),
+            // Legacy native Geometry callers use max_outer as their frozen budget.
+            InverseMetric::Geometry => (opts.max_outer, 0),
+            InverseMetric::GeometryNewton => (opts.max_frozen_outer, opts.max_outer),
+        };
+
+        let mut total_iterations = 0usize;
+        let mut phase_seed = if opts.q_ref.is_empty() {
+            stage1_q.clone()
+        } else {
+            opts.q_ref.clone()
+        };
+        let mut phase_result = None;
+
+        if frozen_budget > 0 {
+            let mut frozen_opts = opts.clone();
+            frozen_opts.metric = InverseMetric::Geometry;
+            frozen_opts.max_frozen_outer = 0;
+            frozen_opts.max_outer = frozen_budget;
+            let result = solve_geometric_outer(
+                problem,
+                &stage2_system,
+                &frozen_opts,
+                &q_bounds,
+                &phase_seed,
+                stage2_kind,
+                &mut solve_inner,
+            )?;
+            total_iterations += result.iterations;
+            phase_seed = result.q.clone();
+            phase_result = Some(result);
+        }
+
+        if newton_budget > 0 {
+            let mut newton_opts = opts.clone();
+            newton_opts.metric = InverseMetric::GeometryNewton;
+            newton_opts.q_ref = phase_seed.clone();
+            newton_opts.max_frozen_outer = 0;
+            newton_opts.max_outer = newton_budget;
+            let mut result = solve_geometric_outer(
+                problem,
+                &stage2_system,
+                &newton_opts,
+                &q_bounds,
+                &phase_seed,
+                stage2_kind,
+                &mut solve_inner,
+            )?;
+            result.iterations += total_iterations;
+            return Ok(result);
+        }
+
+        if let Some(result) = phase_result {
+            return Ok(result);
+        }
+
+        // Both phase budgets are zero: report the Stage-1 seed without a
+        // compliance-weighted update.
+        let mut zero_opts = opts.clone();
+        zero_opts.metric = InverseMetric::Geometry;
+        zero_opts.max_frozen_outer = 0;
+        zero_opts.max_outer = 0;
         return solve_geometric_outer(
             problem,
             &stage2_system,
-            &opts,
+            &zero_opts,
             &q_bounds,
-            &stage1_q,
+            &phase_seed,
             stage2_kind,
             &mut solve_inner,
         );
@@ -1404,7 +1467,7 @@ where
     let mut best_error = probe.error;
     let mut iterations = 0;
     let mut converged = false;
-    let max_outer = opts.max_outer.max(1);
+    let max_outer = opts.max_outer;
     if best_error <= opts.tol.max(1e-12) {
         return Ok(InverseFdmResult {
             q: best_x,
@@ -1571,6 +1634,7 @@ pub fn solve_spg_box(
             tol,
             metric: InverseMetric::Force,
             q_ref: Vec::new(),
+            max_frozen_outer: 0,
             max_outer: DEFAULT_MAX_OUTER,
             cwls_damping: 1e-6,
         },

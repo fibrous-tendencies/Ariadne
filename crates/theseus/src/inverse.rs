@@ -141,7 +141,9 @@ pub struct InverseFdmOptions {
     /// uses the Stage-1 particular. This is an internal test override and is
     /// ignored by `InverseMetric::Force`.
     pub q_ref: Vec<f64>,
-    /// Maximum CWLS update count. Geometric solves stop earlier at tolerance.
+    /// Frozen-target CWLS update count before Gauss--Newton.
+    pub max_frozen_outer: usize,
+    /// Gauss--Newton CWLS update count. Geometric solves stop earlier at tolerance.
     pub max_outer: usize,
     /// Stage-2 damping in force-density coordinates.
     pub cwls_damping: f64,
@@ -175,6 +177,7 @@ impl InverseFdmOptions {
             tol: 1e-6,
             metric: InverseMetric::Force,
             q_ref: Vec::new(),
+            max_frozen_outer: 0,
             max_outer: DEFAULT_MAX_OUTER,
             cwls_damping: 1e-6,
         }

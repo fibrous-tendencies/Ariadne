@@ -240,6 +240,7 @@ fn inverse_opts(
         tol: 1e-8,
         metric: InverseMetric::Force,
         q_ref: Vec::new(),
+        max_frozen_outer: 0,
         max_outer: DEFAULT_MAX_OUTER,
         cwls_damping: 1e-6,
     }
@@ -1738,6 +1739,108 @@ fn frozen_cwls_honors_a_single_update_budget() {
     opts.tol = 1e-12;
     let result = solve_inverse_fdm(&problem, &target, opts).unwrap();
     assert_eq!(result.iterations, 1);
+}
+
+#[test]
+fn phased_frozen_only_matches_legacy_frozen_metric() {
+    let (problem, known_q) = square_grid_problem(4);
+    let (funicular, _) = forward_target(&problem, &known_q);
+    let target = jitter_z(&funicular);
+
+    let mut legacy = geometric_opts(
+        InverseMetric::Geometry,
+        ParticularMethod::Clarabel,
+        LinearAlgebra::Direct,
+        1e-8,
+    );
+    legacy.max_outer = 3;
+    legacy.tol = 1e-12;
+    let legacy_result = solve_inverse_fdm(&problem, &target, legacy).unwrap();
+
+    let mut phased = geometric_opts(
+        InverseMetric::GeometryNewton,
+        ParticularMethod::Clarabel,
+        LinearAlgebra::Direct,
+        1e-8,
+    );
+    phased.max_frozen_outer = 3;
+    phased.max_outer = 0;
+    phased.tol = 1e-12;
+    let phased_result = solve_inverse_fdm(&problem, &target, phased).unwrap();
+
+    assert_eq!(phased_result.iterations, legacy_result.iterations);
+    assert!((phased_result.geometric_error - legacy_result.geometric_error).abs() < 1e-10);
+    for (actual, expected) in phased_result.q.iter().zip(&legacy_result.q) {
+        assert!((actual - expected).abs() < 1e-10);
+    }
+}
+
+#[test]
+fn zero_geometric_phase_budgets_return_stage_one() {
+    let (problem, known_q) = square_grid_problem(4);
+    let (funicular, _) = forward_target(&problem, &known_q);
+    let target = jitter_z(&funicular);
+
+    let force = solve_inverse_fdm(
+        &problem,
+        &target,
+        geometric_opts(
+            InverseMetric::Force,
+            ParticularMethod::Clarabel,
+            LinearAlgebra::Direct,
+            1e-8,
+        ),
+    )
+    .unwrap();
+    let mut stage_one_only = geometric_opts(
+        InverseMetric::GeometryNewton,
+        ParticularMethod::Clarabel,
+        LinearAlgebra::Direct,
+        1e-8,
+    );
+    stage_one_only.max_frozen_outer = 0;
+    stage_one_only.max_outer = 0;
+    let result = solve_inverse_fdm(&problem, &target, stage_one_only).unwrap();
+
+    assert_eq!(result.iterations, 0);
+    for (actual, expected) in result.q.iter().zip(&force.q) {
+        assert!((actual - expected).abs() < 1e-10);
+    }
+}
+
+#[test]
+fn sequential_phases_preserve_the_best_frozen_result() {
+    let (problem, known_q) = square_grid_problem(4);
+    let (funicular, _) = forward_target(&problem, &known_q);
+    let target = jitter_z(&funicular);
+
+    let mut frozen = geometric_opts(
+        InverseMetric::Geometry,
+        ParticularMethod::Clarabel,
+        LinearAlgebra::Direct,
+        1e-8,
+    );
+    frozen.max_outer = 3;
+    frozen.tol = 1e-12;
+    let frozen_result = solve_inverse_fdm(&problem, &target, frozen).unwrap();
+
+    let mut sequential = geometric_opts(
+        InverseMetric::GeometryNewton,
+        ParticularMethod::Clarabel,
+        LinearAlgebra::Direct,
+        1e-8,
+    );
+    sequential.max_frozen_outer = 3;
+    sequential.max_outer = 3;
+    sequential.tol = 1e-12;
+    let sequential_result = solve_inverse_fdm(&problem, &target, sequential).unwrap();
+
+    assert!(
+        sequential_result.geometric_error <= frozen_result.geometric_error + 1e-10,
+        "sequential error {} exceeded frozen error {}",
+        sequential_result.geometric_error,
+        frozen_result.geometric_error
+    );
 }
 
 #[test]
