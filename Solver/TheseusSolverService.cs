@@ -161,9 +161,10 @@ public static class TheseusSolverService
     /// particularMethod: 0 = Gram, 1 = Augmented, 2 = Sparse QR, 3 = Clarabel
     /// (Direct unconstrained only; constrained Direct always uses Clarabel).
     /// linearAlgebra: 0 = Direct, 1 = Iterative.
-    /// metric: 0 = Force, 1 = Geometry, 2 = GeometryNewton. The geometric
-    /// metrics minimize a model of ‖x(q) − x*‖ instead of the force residual
-    /// and seed their outer loop from <paramref name="inputs"/>.QInit.
+    /// metric: 0 = Force, 1 = Geometry, 2 = GeometryNewton. solveForQ selects
+    /// the Stage-1 particular coordinate only; geometric Stage 2 always works
+    /// in q. Signs/lower/upper always constrain q and are transformed by target
+    /// lengths when Stage 1 uses member force.
     public static SolveResult SolveInverseFdm(
         FDM_Network network,
         SolverInputs inputs,
@@ -183,7 +184,8 @@ public static class TheseusSolverService
         int maxIter = 500,
         double tol = 1e-6,
         int metric = 0,
-        int maxOuter = 0)
+        int maxOuter = 0,
+        double cwlsDamping = 1e-6)
     {
         ValidateCommon(network, inputs);
         var context = BuildContext(network);
@@ -205,7 +207,7 @@ public static class TheseusSolverService
 
         var result = solver.SolveInverseFdm(targetFreeXyz, regularization, useL2, maxL1Iter, particularMethod,
             linearAlgebra, enforceZeroRx, enforceZeroRy, enforceZeroRz, solveForQ,
-            signs, lower, upper, maxIter, tol, metric, data.QInit, maxOuter);
+            signs, lower, upper, maxIter, tol, metric, null, maxOuter, cwlsDamping);
         return BuildResult(network, result, context);
     }
 

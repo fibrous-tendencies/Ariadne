@@ -1297,7 +1297,7 @@ fn strategy_all_negative() {
     };
     assert_eq!(
         FactorizationStrategy::from_bounds(&b),
-        FactorizationStrategy::Cholesky
+        FactorizationStrategy::LDL
     );
 }
 

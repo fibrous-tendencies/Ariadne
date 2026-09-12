@@ -6,6 +6,9 @@
 
 use ndarray::Array2;
 use std::sync::atomic::{AtomicBool, Ordering};
+use theseus::inverse::{
+    solve_inverse_fdm, InverseFdmOptions, InverseMetric, ParticularMethod,
+};
 use theseus::optimizer;
 use theseus::sparse::SparseColMatOwned;
 use theseus::types::*;
@@ -187,6 +190,65 @@ fn optimize_target_xyz() {
         "optimize_target_xyz: {} iterations, converged={}",
         result.iterations, result.converged
     );
+}
+
+#[test]
+#[ignore = "manual warm-start benchmark; run with --release --ignored --nocapture"]
+fn benchmark_inverse_warm_starts_for_lbfgsb() {
+    let ne = 8;
+    let bounds = Bounds {
+        lower: vec![0.1; ne],
+        upper: vec![100.0; ne],
+    };
+    let target = Array2::from_shape_vec(
+        (5, 3),
+        vec![
+            1.0, 0.0, 1.0, 2.0, 0.0, 2.0, 3.0, 0.0, 2.5, 4.0, 0.0, 2.0, 5.0, 0.0, 1.0,
+        ],
+    )
+    .unwrap();
+
+    for metric in [
+        InverseMetric::Force,
+        InverseMetric::Geometry,
+        InverseMetric::GeometryNewton,
+    ] {
+        let objectives: Vec<Box<dyn ObjectiveTrait>> = vec![Box::new(TargetXYZ {
+            weight: 1.0,
+            node_indices: vec![1, 2, 3, 4, 5],
+            target: target.clone(),
+            reduction: TargetGeometryReduction::Sse,
+        })];
+        let problem = make_arch_problem(bounds.clone(), objectives);
+        let mut opts = InverseFdmOptions::direct_unconstrained(
+            1e-6,
+            true,
+            1,
+            ParticularMethod::Clarabel,
+            false,
+            false,
+            false,
+            false,
+        );
+        opts.metric = metric;
+        opts.signs = vec![1];
+        opts.lower = vec![0.1];
+        opts.upper = vec![100.0];
+        let inverse = solve_inverse_fdm(&problem, &target, opts).unwrap();
+
+        let mut state = OptimizationState::new(inverse.q, Array2::zeros((0, 3)));
+        let cancel = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        let optimized = optimizer::optimize(&problem, &mut state, None, 1, &cancel).unwrap();
+        eprintln!(
+            "warm-start,metric={metric:?},geom_error={:.6e},lbfgsb_iterations={},\
+             lbfgsb_converged={},lbfgsb_ms={:.3}",
+            inverse.geometric_error,
+            optimized.iterations,
+            optimized.converged,
+            started.elapsed().as_secs_f64() * 1e3
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────

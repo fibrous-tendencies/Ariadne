@@ -719,13 +719,14 @@ pub struct QToNz {
 // ─────────────────────────────────────────────────────────────
 
 /// Adaptive factorization for A(q) = Cn^T diag(q) Cn.
-/// Cholesky when bounds guarantee sign-definiteness; LDL for mixed sign.
+/// Cholesky only when bounds guarantee strictly positive q; LDL otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FactorizationStrategy {
-    /// All q_k > 0  (or all < 0):  A is SPD → Cholesky.
+    /// All q_k > 0: A is SPD → Cholesky.
     /// Uses AMD fill-in reduction for better sparsity in L.
     Cholesky,
-    /// Mixed sign q allowed:  A is symmetric indefinite → LDL.
+    /// Non-positive or mixed-sign q: symmetric diagonal LDL without numeric
+    /// pivoting. Callers must validate solve accuracy near singular pivots.
     LDL,
 }
 
@@ -733,8 +734,7 @@ impl FactorizationStrategy {
     /// Choose strategy from the bounds on q.
     pub fn from_bounds(bounds: &Bounds) -> Self {
         let all_positive = bounds.lower.iter().all(|&lb| lb > 0.0);
-        let all_negative = bounds.upper.iter().all(|&ub| ub < 0.0);
-        if all_positive || all_negative {
+        if all_positive {
             Self::Cholesky
         } else {
             Self::LDL

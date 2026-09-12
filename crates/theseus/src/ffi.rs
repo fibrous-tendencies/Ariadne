@@ -2701,7 +2701,9 @@ pub unsafe extern "C" fn theseus_classify_prestress(
 /// of this value.
 /// Used only for Direct unconstrained solves.
 /// `linear_algebra`: 0 = Direct, 1 = Iterative.
-/// Empty `signs` / `lower` / `upper` (length 0) means unconstrained on that channel.
+/// Empty `signs` / `lower` / `upper` (length 0) means unconstrained on that
+/// channel. These arrays always constrain q. When `solve_for_q = 0`, target
+/// lengths transform the q box to Stage-1 member-force coordinates.
 ///
 /// `target_free_xyz` must point to `num_free * 3` doubles (row-major).
 ///
@@ -2775,23 +2777,104 @@ pub unsafe extern "C" fn theseus_solve_inverse_fdm(
     )
 }
 
-/// Solve inverse FDM at a target geometry under a selectable residual metric,
-/// then forward-solve.
+/// Solve inverse FDM with selectable residual metric and default CWLS damping.
 ///
-/// Extends [`theseus_solve_inverse_fdm`] with the geometric metric controls.
+/// Retained as the first metric ABI. New callers that expose independent
+/// Stage-2 damping should use [`theseus_solve_inverse_fdm_metric_cwls`].
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn theseus_solve_inverse_fdm_metric(
+    handle: *mut TheseusHandle,
+    target_free_xyz: *const f64,
+    regularization: f64,
+    use_l2: i32,
+    max_l1_iter: usize,
+    particular_method: i32,
+    linear_algebra: i32,
+    enforce_zero_rx: i32,
+    enforce_zero_ry: i32,
+    enforce_zero_rz: i32,
+    solve_for_q: i32,
+    signs: *const i32,
+    n_signs: usize,
+    lower: *const f64,
+    n_lower: usize,
+    upper: *const f64,
+    n_upper: usize,
+    max_iter: usize,
+    tol: f64,
+    metric: i32,
+    q_ref: *const f64,
+    n_q_ref: usize,
+    max_outer: usize,
+    out_q: *mut f64,
+    out_xyz: *mut f64,
+    out_lengths: *mut f64,
+    out_forces: *mut f64,
+    out_reactions: *mut f64,
+    out_iterations: *mut usize,
+    out_converged: *mut bool,
+    out_geom_error: *mut f64,
+) -> i32 {
+    theseus_solve_inverse_fdm_metric_cwls(
+        handle,
+        target_free_xyz,
+        regularization,
+        1e-6,
+        use_l2,
+        max_l1_iter,
+        particular_method,
+        linear_algebra,
+        enforce_zero_rx,
+        enforce_zero_ry,
+        enforce_zero_rz,
+        solve_for_q,
+        signs,
+        n_signs,
+        lower,
+        n_lower,
+        upper,
+        n_upper,
+        max_iter,
+        tol,
+        metric,
+        q_ref,
+        n_q_ref,
+        max_outer,
+        out_q,
+        out_xyz,
+        out_lengths,
+        out_forces,
+        out_reactions,
+        out_iterations,
+        out_converged,
+        out_geom_error,
+    )
+}
+
+/// Solve inverse FDM at a target geometry under a selectable residual metric,
+/// independent Stage-1 regularization and Stage-2 CWLS damping, then
+/// forward-solve.
+///
+/// Extends [`theseus_solve_inverse_fdm_metric`] with `cwls_damping`, the
+/// Stage-2 coefficient in `cwls_damping * ‖Δq‖²`. `regularization` remains
+/// the Stage-1 particular regularizer.
 ///
 /// `metric` ABI mapping (append-only):
 /// 0 = Force (`min ‖Mx − p‖`, historical), 1 = Geometry (weighted by the
 /// Laplacian compliance, Jacobian frozen at the target), 2 = GeometryNewton
 /// (same weighting, Jacobian re-assembled at the current form-found geometry).
 ///
-/// Geometric metrics require a particular method that can be left-weighted
-/// without densifying: Clarabel, augmented saddle, LSQR, or SPG. Gram and
-/// sparse QR are rejected.
+/// The selected particular method controls Stage 1. Geometric metrics then
+/// run Stage 2 in q coordinates using Clarabel/weighted saddle for Direct or
+/// SPG/LSQR for Iterative, independently of the Stage-1 direct method.
+/// `solve_for_q` selects only whether Stage 1 uses q or member force.
 ///
 /// `q_ref` seeds the geometric outer loop and must hold `num_edges` doubles
-/// when non-null; a null pointer falls back to the handle's current q.
-/// `max_outer` of 0 selects the built-in default.
+/// when non-null; a null pointer uses the Stage-1 result.
+/// For Geometry, `max_outer = 0` means one frozen-target CWLS update. For
+/// GeometryNewton, 0 selects the default of three updates. Positive budgets
+/// are honored without a fixed upper cap and may stop early at tolerance.
 /// `out_geom_error` receives `‖x(q) − x*‖` and may be null.
 ///
 /// Returns 0 on success, -1 on error, -2 on internal panic.
@@ -2800,10 +2883,11 @@ pub unsafe extern "C" fn theseus_solve_inverse_fdm(
 /// Valid handle and output buffers.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
-pub unsafe extern "C" fn theseus_solve_inverse_fdm_metric(
+pub unsafe extern "C" fn theseus_solve_inverse_fdm_metric_cwls(
     handle: *mut TheseusHandle,
     target_free_xyz: *const f64,
     regularization: f64,
+    cwls_damping: f64,
     use_l2: i32,
     max_l1_iter: usize,
     particular_method: i32,
@@ -2864,11 +2948,9 @@ pub unsafe extern "C" fn theseus_solve_inverse_fdm_metric(
         let algebra = crate::inverse::LinearAlgebra::try_from(linear_algebra)?;
         let metric = crate::inverse::InverseMetric::try_from(metric)?;
 
-        // A null q_ref falls back to the handle's current force densities,
-        // which carry whatever q_init the caller created the handle with.
         let q_ref = if metric.is_geometric() {
             if q_ref.is_null() || n_q_ref == 0 {
-                h.state.force_densities.clone()
+                Vec::new()
             } else {
                 if n_q_ref != ne {
                     return Err(TheseusError::Shape(format!(
@@ -2880,10 +2962,11 @@ pub unsafe extern "C" fn theseus_solve_inverse_fdm_metric(
         } else {
             Vec::new()
         };
-        let max_outer = if max_outer == 0 {
-            crate::inverse::DEFAULT_MAX_OUTER
-        } else {
-            max_outer
+        let max_outer = match (metric, max_outer) {
+            (crate::inverse::InverseMetric::Geometry, 0) => 1,
+            (crate::inverse::InverseMetric::GeometryNewton, 0) => crate::inverse::DEFAULT_MAX_OUTER,
+            (_, 0) => 1,
+            (_, requested) => requested,
         };
         let result = crate::inverse::solve_inverse_fdm(
             &h.problem,
@@ -2906,6 +2989,7 @@ pub unsafe extern "C" fn theseus_solve_inverse_fdm_metric(
                 metric,
                 q_ref,
                 max_outer,
+                cwls_damping,
             },
         )?;
         let q = result.q;

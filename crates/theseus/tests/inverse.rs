@@ -200,7 +200,18 @@ fn tension_spg(
     tol: f64,
 ) -> theseus::inverse::SpgBoxResult {
     solve_spg_box(
-        problem, target, max_iter, tol, &[1], &[], &[], 0.0, false, false, false, true,
+        problem,
+        target,
+        max_iter,
+        tol,
+        &[1],
+        &[],
+        &[],
+        0.0,
+        false,
+        false,
+        false,
+        true,
     )
     .unwrap()
 }
@@ -230,6 +241,7 @@ fn inverse_opts(
         metric: InverseMetric::Force,
         q_ref: Vec::new(),
         max_outer: DEFAULT_MAX_OUTER,
+        cwls_damping: 1e-6,
     }
 }
 
@@ -299,7 +311,16 @@ fn pseudoinverse_l1_and_solve_for_force_return_finite_values() {
 
     let l1 = pinv(&problem, &target, false, false);
     let solve_for_force = solve_pseudoinverse_dispatch(
-        &problem, &target, 1e-10, true, 20, ParticularMethod::Gram, false, false, false, false,
+        &problem,
+        &target,
+        1e-10,
+        true,
+        20,
+        ParticularMethod::Gram,
+        false,
+        false,
+        false,
+        false,
     )
     .unwrap();
 
@@ -316,7 +337,16 @@ fn pseudoinverse_solve_for_force_rejects_degenerate_target_edges() {
     let target = Array2::from_shape_vec((1, 3), vec![0.0, 0.0, 0.0]).unwrap();
 
     let result = solve_pseudoinverse_dispatch(
-        &problem, &target, 1e-6, true, 20, ParticularMethod::Gram, false, false, false, false,
+        &problem,
+        &target,
+        1e-6,
+        true,
+        20,
+        ParticularMethod::Gram,
+        false,
+        false,
+        false,
+        false,
     );
 
     assert!(result.is_err());
@@ -329,7 +359,16 @@ fn pseudoinverse_reaction_constraints_reduce_reaction_norm() {
 
     let unconstrained = pinv(&problem, &target, true, false);
     let constrained = solve_pseudoinverse_dispatch(
-        &problem, &target, 1e-8, true, 20, ParticularMethod::Gram, true, true, true, true,
+        &problem,
+        &target,
+        1e-8,
+        true,
+        20,
+        ParticularMethod::Gram,
+        true,
+        true,
+        true,
+        true,
     )
     .unwrap();
 
@@ -517,7 +556,10 @@ fn lower_and_upper_bounds_are_respected_by_both_engines() {
         opts.upper = vec![4.0];
         opts.max_iter = 4_000;
         let result = solve_inverse_fdm(&problem, &target, opts).unwrap();
-        assert!(result.q.iter().all(|q| (0.5 - 1e-6..=4.0 + 1e-6).contains(q)));
+        assert!(result
+            .q
+            .iter()
+            .all(|q| (0.5 - 1e-6..=4.0 + 1e-6).contains(q)));
     }
 }
 
@@ -527,7 +569,13 @@ fn near_flat_box_caps_unconstrained_particular() {
     let unconstrained = solve_inverse_fdm(
         &problem,
         &target,
-        inverse_opts(0.0, true, ParticularMethod::Augmented, LinearAlgebra::Direct, false),
+        inverse_opts(
+            0.0,
+            true,
+            ParticularMethod::Augmented,
+            LinearAlgebra::Direct,
+            false,
+        ),
     )
     .unwrap();
     let unconstrained_max = max_abs(&unconstrained.q);
@@ -542,7 +590,7 @@ fn near_flat_box_caps_unconstrained_particular() {
         opts.max_iter = 8_000;
         opts.tol = 1e-7;
         let boxed = solve_inverse_fdm(&problem, &target, opts).unwrap();
-        // Bound is on member force t; recovered q = t / L so |q| is also capped near 10/L ≈ 10.
+        // Public bounds are on q even though Stage 1 solves member force.
         let boxed_max = max_abs(&boxed.q);
         assert!(
             boxed_max < unconstrained_max * 0.5,
@@ -561,9 +609,21 @@ fn near_flat_box_caps_unconstrained_particular() {
 fn clarabel_and_spg_agree_on_a_simple_box() {
     let (problem, _) = triangle_problem();
     let (target, _) = forward_target(&problem, &[2.0, 3.0]);
-    let mut clarabel = inverse_opts(0.0, true, ParticularMethod::Augmented, LinearAlgebra::Direct, true);
+    let mut clarabel = inverse_opts(
+        0.0,
+        true,
+        ParticularMethod::Augmented,
+        LinearAlgebra::Direct,
+        true,
+    );
     clarabel.signs = vec![1];
-    let mut spg = inverse_opts(0.0, true, ParticularMethod::Augmented, LinearAlgebra::Iterative, true);
+    let mut spg = inverse_opts(
+        0.0,
+        true,
+        ParticularMethod::Augmented,
+        LinearAlgebra::Iterative,
+        true,
+    );
     spg.signs = vec![1];
     spg.max_iter = 8_000;
     spg.tol = 1e-8;
@@ -582,13 +642,25 @@ fn unconstrained_lsqr_agrees_with_qr_on_tall_full_rank_arch() {
     let qr = solve_inverse_fdm(
         &problem,
         &target,
-        inverse_opts(0.0, true, ParticularMethod::SparseQr, LinearAlgebra::Direct, true),
+        inverse_opts(
+            0.0,
+            true,
+            ParticularMethod::SparseQr,
+            LinearAlgebra::Direct,
+            true,
+        ),
     )
     .unwrap();
     let lsqr = solve_inverse_fdm(
         &problem,
         &target,
-        inverse_opts(0.0, true, ParticularMethod::Augmented, LinearAlgebra::Iterative, true),
+        inverse_opts(
+            0.0,
+            true,
+            ParticularMethod::Augmented,
+            LinearAlgebra::Iterative,
+            true,
+        ),
     )
     .unwrap();
     assert_eq!(qr.q.len(), lsqr.q.len());
@@ -602,12 +674,42 @@ fn irls_runs_on_every_inner_and_stays_finite() {
     let (problem, _) = arch_problem(false);
     let (target, _) = forward_target(&problem, &[1.0; 8]);
     let cases = [
-        (ParticularMethod::Augmented, LinearAlgebra::Direct, Vec::new(), Vec::new()),
-        (ParticularMethod::Gram, LinearAlgebra::Direct, Vec::new(), Vec::new()),
-        (ParticularMethod::SparseQr, LinearAlgebra::Direct, Vec::new(), Vec::new()),
-        (ParticularMethod::Augmented, LinearAlgebra::Iterative, Vec::new(), Vec::new()),
-        (ParticularMethod::Augmented, LinearAlgebra::Direct, vec![1], Vec::new()),
-        (ParticularMethod::Augmented, LinearAlgebra::Iterative, vec![1], Vec::new()),
+        (
+            ParticularMethod::Augmented,
+            LinearAlgebra::Direct,
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            ParticularMethod::Gram,
+            LinearAlgebra::Direct,
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            ParticularMethod::SparseQr,
+            LinearAlgebra::Direct,
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            ParticularMethod::Augmented,
+            LinearAlgebra::Iterative,
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            ParticularMethod::Augmented,
+            LinearAlgebra::Direct,
+            vec![1],
+            Vec::new(),
+        ),
+        (
+            ParticularMethod::Augmented,
+            LinearAlgebra::Iterative,
+            vec![1],
+            Vec::new(),
+        ),
     ];
     for (particular, algebra, signs, lower) in cases {
         // Direct augmented IRLS uses Tikhonov here because strict Direct MP
@@ -659,10 +761,22 @@ fn reaction_rows_reduce_reaction_norm_on_clarabel_and_spg() {
 
 #[test]
 fn particular_method_ffi_mapping_includes_clarabel() {
-    assert_eq!(ParticularMethod::try_from(0).unwrap(), ParticularMethod::Gram);
-    assert_eq!(ParticularMethod::try_from(1).unwrap(), ParticularMethod::Augmented);
-    assert_eq!(ParticularMethod::try_from(2).unwrap(), ParticularMethod::SparseQr);
-    assert_eq!(ParticularMethod::try_from(3).unwrap(), ParticularMethod::Clarabel);
+    assert_eq!(
+        ParticularMethod::try_from(0).unwrap(),
+        ParticularMethod::Gram
+    );
+    assert_eq!(
+        ParticularMethod::try_from(1).unwrap(),
+        ParticularMethod::Augmented
+    );
+    assert_eq!(
+        ParticularMethod::try_from(2).unwrap(),
+        ParticularMethod::SparseQr
+    );
+    assert_eq!(
+        ParticularMethod::try_from(3).unwrap(),
+        ParticularMethod::Clarabel
+    );
     assert!(ParticularMethod::try_from(4).is_err());
 }
 
@@ -674,23 +788,44 @@ fn unconstrained_clarabel_matches_tikhonov_and_solves_lambda_zero() {
     let clarabel = solve_inverse_fdm(
         &problem,
         &target,
-        inverse_opts(lambda, true, ParticularMethod::Clarabel, LinearAlgebra::Direct, true),
+        inverse_opts(
+            lambda,
+            true,
+            ParticularMethod::Clarabel,
+            LinearAlgebra::Direct,
+            true,
+        ),
     )
     .unwrap();
     let tikhonov = solve_inverse_fdm(
         &problem,
         &target,
-        inverse_opts(lambda, true, ParticularMethod::Augmented, LinearAlgebra::Direct, true),
+        inverse_opts(
+            lambda,
+            true,
+            ParticularMethod::Augmented,
+            LinearAlgebra::Direct,
+            true,
+        ),
     )
     .unwrap();
     for (left, right) in clarabel.q.iter().zip(&tikhonov.q) {
-        assert!((left - right).abs() < 2e-4, "Clarabel {left} vs Tikhonov {right}");
+        assert!(
+            (left - right).abs() < 2e-4,
+            "Clarabel {left} vs Tikhonov {right}"
+        );
     }
 
     let zero = solve_inverse_fdm(
         &problem,
         &target,
-        inverse_opts(0.0, true, ParticularMethod::Clarabel, LinearAlgebra::Direct, true),
+        inverse_opts(
+            0.0,
+            true,
+            ParticularMethod::Clarabel,
+            LinearAlgebra::Direct,
+            true,
+        ),
     )
     .unwrap();
     assert!(equilibrium_residual(&problem, &edges, &target, &zero.q) < 1e-6);
@@ -702,7 +837,13 @@ fn direct_mp_errors_on_singular_saddle_but_zero_lambda_lsqr_is_minimum_norm() {
     let direct = solve_inverse_fdm(
         &problem,
         &target,
-        inverse_opts(0.0, true, ParticularMethod::Augmented, LinearAlgebra::Direct, true),
+        inverse_opts(
+            0.0,
+            true,
+            ParticularMethod::Augmented,
+            LinearAlgebra::Direct,
+            true,
+        ),
     )
     .unwrap_err();
     let message = direct.to_string();
@@ -712,7 +853,13 @@ fn direct_mp_errors_on_singular_saddle_but_zero_lambda_lsqr_is_minimum_norm() {
     let iterative = solve_inverse_fdm(
         &problem,
         &target,
-        inverse_opts(0.0, true, ParticularMethod::Gram, LinearAlgebra::Iterative, true),
+        inverse_opts(
+            0.0,
+            true,
+            ParticularMethod::Gram,
+            LinearAlgebra::Iterative,
+            true,
+        ),
     )
     .unwrap();
     assert!(iterative.converged);
@@ -727,13 +874,25 @@ fn direct_mp_matches_zero_lambda_lsqr_when_saddle_is_nonsingular() {
     let direct = solve_inverse_fdm(
         &problem,
         &target,
-        inverse_opts(0.0, true, ParticularMethod::Augmented, LinearAlgebra::Direct, false),
+        inverse_opts(
+            0.0,
+            true,
+            ParticularMethod::Augmented,
+            LinearAlgebra::Direct,
+            false,
+        ),
     )
     .unwrap();
     let iterative = solve_inverse_fdm(
         &problem,
         &target,
-        inverse_opts(0.0, true, ParticularMethod::Clarabel, LinearAlgebra::Iterative, false),
+        inverse_opts(
+            0.0,
+            true,
+            ParticularMethod::Clarabel,
+            LinearAlgebra::Iterative,
+            false,
+        ),
     )
     .unwrap();
     for (mp, lsqr) in direct.q.iter().zip(&iterative.q) {
@@ -752,25 +911,46 @@ fn regularized_lsqr_matches_direct_solvers_and_reports_iterations() {
     let iterative = solve_inverse_fdm(
         &problem,
         &target,
-        inverse_opts(lambda, true, ParticularMethod::SparseQr, LinearAlgebra::Iterative, true),
+        inverse_opts(
+            lambda,
+            true,
+            ParticularMethod::SparseQr,
+            LinearAlgebra::Iterative,
+            true,
+        ),
     )
     .unwrap();
     let tikhonov = solve_inverse_fdm(
         &problem,
         &target,
-        inverse_opts(lambda, true, ParticularMethod::Augmented, LinearAlgebra::Direct, true),
+        inverse_opts(
+            lambda,
+            true,
+            ParticularMethod::Augmented,
+            LinearAlgebra::Direct,
+            true,
+        ),
     )
     .unwrap();
     let gram = solve_inverse_fdm(
         &problem,
         &target,
-        inverse_opts(lambda, true, ParticularMethod::Gram, LinearAlgebra::Direct, true),
+        inverse_opts(
+            lambda,
+            true,
+            ParticularMethod::Gram,
+            LinearAlgebra::Direct,
+            true,
+        ),
     )
     .unwrap();
     assert!(iterative.converged);
     assert!(iterative.iterations > 1);
     for ((lsqr, saddle), normal) in iterative.q.iter().zip(&tikhonov.q).zip(&gram.q) {
-        assert!((lsqr - saddle).abs() < 2e-5, "LSQR {lsqr} vs saddle {saddle}");
+        assert!(
+            (lsqr - saddle).abs() < 2e-5,
+            "LSQR {lsqr} vs saddle {saddle}"
+        );
         assert!((lsqr - normal).abs() < 2e-5, "LSQR {lsqr} vs Gram {normal}");
     }
 }
@@ -800,7 +980,10 @@ fn iterative_ignores_every_direct_particular_selection() {
         .unwrap();
         assert_eq!(result.iterations, baseline.iterations);
         for (left, right) in result.q.iter().zip(&baseline.q) {
-            assert!((left - right).abs() < 1e-12, "{method:?}: {left} vs {right}");
+            assert!(
+                (left - right).abs() < 1e-12,
+                "{method:?}: {left} vs {right}"
+            );
         }
     }
 }
@@ -811,13 +994,25 @@ fn regularization_materially_changes_scaled_lsqr_fixture() {
     let zero = solve_inverse_fdm(
         &problem,
         &target,
-        inverse_opts(0.0, true, ParticularMethod::Gram, LinearAlgebra::Iterative, false),
+        inverse_opts(
+            0.0,
+            true,
+            ParticularMethod::Gram,
+            LinearAlgebra::Iterative,
+            false,
+        ),
     )
     .unwrap();
     let regularized = solve_inverse_fdm(
         &problem,
         &target,
-        inverse_opts(1e-2, true, ParticularMethod::Gram, LinearAlgebra::Iterative, false),
+        inverse_opts(
+            1e-2,
+            true,
+            ParticularMethod::Gram,
+            LinearAlgebra::Iterative,
+            false,
+        ),
     )
     .unwrap();
     assert!(
@@ -834,7 +1029,13 @@ fn sparse_qr_rejects_wide_and_rank_deficient_systems() {
     let error = solve_inverse_fdm(
         &rank_deficient,
         &target,
-        inverse_opts(0.0, true, ParticularMethod::SparseQr, LinearAlgebra::Direct, true),
+        inverse_opts(
+            0.0,
+            true,
+            ParticularMethod::SparseQr,
+            LinearAlgebra::Direct,
+            true,
+        ),
     )
     .unwrap_err()
     .to_string();
@@ -910,12 +1111,32 @@ fn benchmark_inverse_approximately_800_edges() {
     );
 
     let cases = [
-        ("mp", 0.0, ParticularMethod::Augmented, LinearAlgebra::Direct),
-        ("tikhonov", 1e-6, ParticularMethod::Augmented, LinearAlgebra::Direct),
+        (
+            "mp",
+            0.0,
+            ParticularMethod::Augmented,
+            LinearAlgebra::Direct,
+        ),
+        (
+            "tikhonov",
+            1e-6,
+            ParticularMethod::Augmented,
+            LinearAlgebra::Direct,
+        ),
         ("qr", 0.0, ParticularMethod::SparseQr, LinearAlgebra::Direct),
         ("gram", 1e-6, ParticularMethod::Gram, LinearAlgebra::Direct),
-        ("lsqr-zero", 0.0, ParticularMethod::Clarabel, LinearAlgebra::Iterative),
-        ("lsqr-regularized", 1e-6, ParticularMethod::Gram, LinearAlgebra::Iterative),
+        (
+            "lsqr-zero",
+            0.0,
+            ParticularMethod::Clarabel,
+            LinearAlgebra::Iterative,
+        ),
+        (
+            "lsqr-regularized",
+            1e-6,
+            ParticularMethod::Gram,
+            LinearAlgebra::Iterative,
+        ),
     ];
     for (name, lambda, method, algebra) in cases {
         let started = Instant::now();
@@ -969,9 +1190,8 @@ fn geometric_error_identity_matches_an_independent_forward_solve() {
     for amount in [0.0, 1e-3, 0.05, 0.4] {
         let target = perturb(&funicular, amount);
         let predicted = geometric_error_vector(&problem, &target, &q).unwrap();
-        let actual = Array2::from_shape_fn(funicular.dim(), |(i, d)| {
-            funicular[[i, d]] - target[[i, d]]
-        });
+        let actual =
+            Array2::from_shape_fn(funicular.dim(), |(i, d)| funicular[[i, d]] - target[[i, d]]);
 
         for i in 0..actual.nrows() {
             for d in 0..3 {
@@ -1076,9 +1296,7 @@ fn geometric_metric_lands_closer_to_a_near_funicular_target_than_the_force_metri
     let geometry_error = achieved_error(&problem, &target, &geometry.q);
     let newton_error = achieved_error(&problem, &target, &newton.q);
 
-    eprintln!(
-        "force={force_error:.6e} geometry={geometry_error:.6e} newton={newton_error:.6e}"
-    );
+    eprintln!("force={force_error:.6e} geometry={geometry_error:.6e} newton={newton_error:.6e}");
     assert!(
         geometry_error < force_error,
         "geometric metric ({geometry_error:.6e}) should beat the force metric \
@@ -1126,7 +1344,11 @@ fn geometric_backends_agree_on_the_same_weighted_problem() {
     let target = perturb(&funicular, 0.02);
 
     let cases = [
-        ("clarabel", ParticularMethod::Clarabel, LinearAlgebra::Direct),
+        (
+            "clarabel",
+            ParticularMethod::Clarabel,
+            LinearAlgebra::Direct,
+        ),
         ("saddle", ParticularMethod::Augmented, LinearAlgebra::Direct),
         ("spg", ParticularMethod::Clarabel, LinearAlgebra::Iterative),
     ];
@@ -1154,13 +1376,13 @@ fn geometric_backends_agree_on_the_same_weighted_problem() {
 }
 
 #[test]
-fn geometric_metric_rejects_gram_and_sparse_qr() {
+fn gram_and_sparse_qr_can_initialize_geometric_stage_two() {
     let (problem, _) = arch_problem(false);
     let q = vec![1.0; 8];
     let (funicular, _) = forward_target(&problem, &q);
 
     for particular in [ParticularMethod::Gram, ParticularMethod::SparseQr] {
-        let error = solve_inverse_fdm(
+        let result = solve_inverse_fdm(
             &problem,
             &funicular,
             InverseFdmOptions {
@@ -1169,12 +1391,9 @@ fn geometric_metric_rejects_gram_and_sparse_qr() {
                 ..inverse_opts(1e-8, true, particular, LinearAlgebra::Direct, true)
             },
         )
-        .expect_err("expected the geometric metric to reject a densifying backend");
-        let message = error.to_string();
-        assert!(
-            message.contains("Gram or sparse QR"),
-            "unexpected rejection message for {particular:?}: {message}"
-        );
+        .unwrap_or_else(|error| panic!("{particular:?} initializer failed: {error}"));
+        assert!(result.q.iter().all(|q| q.is_finite()));
+        assert!(result.geometric_error < 1e-6);
     }
 }
 
@@ -1190,7 +1409,13 @@ fn geometric_metric_rejects_l1() {
         InverseFdmOptions {
             metric: InverseMetric::Geometry,
             max_outer: 4,
-            ..inverse_opts(1e-8, false, ParticularMethod::Clarabel, LinearAlgebra::Direct, true)
+            ..inverse_opts(
+                1e-8,
+                false,
+                ParticularMethod::Clarabel,
+                LinearAlgebra::Direct,
+                true,
+            )
         },
     )
     .expect_err("expected the geometric metric to reject IRLS");
@@ -1211,7 +1436,13 @@ fn force_metric_is_unchanged_by_the_metric_plumbing() {
     let result = solve_inverse_fdm(
         &problem,
         &target,
-        inverse_opts(0.0, true, ParticularMethod::Augmented, LinearAlgebra::Direct, true),
+        inverse_opts(
+            0.0,
+            true,
+            ParticularMethod::Augmented,
+            LinearAlgebra::Direct,
+            true,
+        ),
     )
     .unwrap();
 
@@ -1219,6 +1450,376 @@ fn force_metric_is_unchanged_by_the_metric_plumbing() {
         assert!(
             (got - want).abs() < 1e-8,
             "force metric changed: got {got}, expected {want}"
+        );
+    }
+}
+
+fn square_grid_problem(side: usize) -> (Problem, Vec<f64>) {
+    let node = |row: usize, col: usize| row * side + col;
+    let mut edges = Vec::new();
+    for row in 0..side {
+        for col in 0..side {
+            if col + 1 < side {
+                edges.push((node(row, col), node(row, col + 1)));
+            }
+            if row + 1 < side {
+                edges.push((node(row, col), node(row + 1, col)));
+            }
+        }
+    }
+    let fixed = vec![
+        node(0, 0),
+        node(0, side - 1),
+        node(side - 1, 0),
+        node(side - 1, side - 1),
+    ];
+    let free: Vec<usize> = (0..side * side)
+        .filter(|index| !fixed.contains(index))
+        .collect();
+    let fixed_positions = Array2::from_shape_fn((4, 3), |(i, axis)| {
+        let locations = [
+            [0.0, 0.0, 0.0],
+            [(side - 1) as f64, 0.0, 0.0],
+            [0.0, (side - 1) as f64, 0.0],
+            [(side - 1) as f64, (side - 1) as f64, 0.0],
+        ];
+        locations[i][axis]
+    });
+    let mut loads = Array2::zeros((free.len(), 3));
+    for i in 0..free.len() {
+        loads[[i, 2]] = -1.0;
+    }
+    let problem = make_problem(&edges, side * side, free, fixed, loads, fixed_positions);
+
+    let mut state = 0x5eed_u64;
+    let q = (0..edges.len())
+        .map(|_| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let unit = ((state >> 32) as u32) as f64 / u32::MAX as f64;
+            10.0_f64.powf(-3.0 + 5.0 * unit)
+        })
+        .collect();
+    (problem, q)
+}
+
+fn jitter_z(target: &Array2<f64>) -> Array2<f64> {
+    let mut state = 0xc0ffee_u64;
+    let mut result = target.clone();
+    for i in 0..result.nrows() {
+        state = state
+            .wrapping_mul(2862933555777941757)
+            .wrapping_add(3037000493);
+        let unit = ((state >> 32) as u32) as f64 / u32::MAX as f64;
+        result[[i, 2]] += 0.2 * unit - 0.1;
+    }
+    result
+}
+
+#[test]
+fn staged_metrics_run_on_deterministic_corner_anchored_grid() {
+    let (problem, known_q) = square_grid_problem(4);
+    let (funicular, _) = forward_target(&problem, &known_q);
+    let target = jitter_z(&funicular);
+    let mut results = Vec::new();
+    for metric in [
+        InverseMetric::Force,
+        InverseMetric::Geometry,
+        InverseMetric::GeometryNewton,
+    ] {
+        let mut opts = inverse_opts(
+            1e-8,
+            true,
+            ParticularMethod::Clarabel,
+            LinearAlgebra::Direct,
+            false,
+        );
+        opts.metric = metric;
+        opts.lower = vec![1e-3];
+        opts.upper = vec![100.0];
+        let result = solve_inverse_fdm(&problem, &target, opts).unwrap();
+        assert!(result
+            .q
+            .iter()
+            .all(|q| q.is_finite() && (1e-3 - 1e-8..=100.0 + 1e-8).contains(q)));
+        assert!(result.geometric_error.is_finite());
+        results.push(result.geometric_error);
+    }
+    assert!(
+        results[1] <= results[0] * 1.05 && results[2] <= results[0] * 1.05,
+        "staged metrics should preserve or improve geometry: {results:?}"
+    );
+}
+
+#[test]
+fn stage_one_initializes_geometry_and_lower_bound_is_sensitive() {
+    let (problem, known_q) = square_grid_problem(4);
+    let (funicular, _) = forward_target(&problem, &known_q);
+
+    let mut force_opts = inverse_opts(
+        1e-8,
+        true,
+        ParticularMethod::Gram,
+        LinearAlgebra::Direct,
+        true,
+    );
+    force_opts.lower = vec![1e-3];
+    let stage_one = solve_inverse_fdm(&problem, &funicular, force_opts.clone()).unwrap();
+    force_opts.metric = InverseMetric::Geometry;
+    let staged = solve_inverse_fdm(&problem, &funicular, force_opts).unwrap();
+    assert!(staged.geometric_error <= stage_one.geometric_error + 1e-8);
+
+    let target = jitter_z(&funicular);
+    let mut low = inverse_opts(
+        0.0,
+        true,
+        ParticularMethod::Clarabel,
+        LinearAlgebra::Direct,
+        false,
+    );
+    low.lower = vec![1e-3];
+    low.upper = vec![100.0];
+    let mut high = low.clone();
+    high.lower = vec![10.0];
+    let low_result = solve_inverse_fdm(&problem, &target, low).unwrap();
+    let high_result = solve_inverse_fdm(&problem, &target, high).unwrap();
+    assert!(high_result.q.iter().all(|q| *q >= 10.0 - 1e-7));
+    assert!(low_result
+        .q
+        .iter()
+        .zip(&high_result.q)
+        .any(|(left, right)| (left - right).abs() > 1e-3));
+}
+
+#[test]
+fn mixed_sign_and_compression_geometric_identity_match_forward_solve() {
+    let (problem, _) = arch_problem(false);
+    for q in [
+        vec![1.3, -0.7, 2.1, -0.9, 1.6, -1.1, 0.5, 2.4],
+        vec![-1.3, -0.7, -2.1, -0.9, -1.6, -1.1, -0.5, -2.4],
+    ] {
+        let (funicular, _) = forward_target(&problem, &q);
+        let target = perturb(&funicular, 0.02);
+        let predicted = geometric_error_vector(&problem, &target, &q).unwrap();
+        let actual =
+            Array2::from_shape_fn(funicular.dim(), |(i, d)| funicular[[i, d]] - target[[i, d]]);
+        for (left, right) in predicted.iter().zip(actual.iter()) {
+            assert!((left - right).abs() < 1e-8, "{left} != {right}");
+        }
+    }
+}
+
+#[test]
+fn mixed_sign_geometric_direct_and_iterative_backends_agree() {
+    let (problem, _) = arch_problem(false);
+    let q = vec![1.3, -0.7, 2.1, -0.9, 1.6, -1.1, 0.5, 2.4];
+    let (funicular, _) = forward_target(&problem, &q);
+    let target = perturb(&funicular, 0.01);
+    let mut errors = Vec::new();
+    for algebra in [LinearAlgebra::Direct, LinearAlgebra::Iterative] {
+        let mut opts = inverse_opts(1e-8, true, ParticularMethod::Gram, algebra, true);
+        opts.metric = InverseMetric::Geometry;
+        opts.q_ref = q.clone();
+        opts.max_iter = 8_000;
+        opts.tol = 1e-8;
+        let result = solve_inverse_fdm(&problem, &target, opts).unwrap();
+        errors.push(result.geometric_error);
+    }
+    let scale = errors[0].max(errors[1]).max(1e-12);
+    assert!((errors[0] - errors[1]).abs() <= 0.1 * scale, "{errors:?}");
+}
+
+#[test]
+fn mixed_sign_particular_initializes_cwls_in_q_and_force_coordinates() {
+    let (problem, _) = arch_problem(false);
+    let known_q = vec![1.3, -0.7, 2.1, -0.9, 1.6, -1.1, 0.5, 2.4];
+    let signs: Vec<i32> = known_q
+        .iter()
+        .map(|value| if *value > 0.0 { 1 } else { -1 })
+        .collect();
+    let lower: Vec<f64> = signs
+        .iter()
+        .map(|sign| if *sign > 0 { 0.1 } else { -3.0 })
+        .collect();
+    let upper: Vec<f64> = signs
+        .iter()
+        .map(|sign| if *sign > 0 { 3.0 } else { -0.1 })
+        .collect();
+    let (funicular, _) = forward_target(&problem, &known_q);
+    let target = perturb(&funicular, 0.005);
+
+    for solve_for_q in [true, false] {
+        let mut opts = inverse_opts(
+            1e-6,
+            true,
+            ParticularMethod::Clarabel,
+            LinearAlgebra::Direct,
+            solve_for_q,
+        );
+        opts.metric = InverseMetric::GeometryNewton;
+        opts.signs = signs.clone();
+        opts.lower = lower.clone();
+        opts.upper = upper.clone();
+        opts.q_ref.clear();
+        let result = solve_inverse_fdm(&problem, &target, opts).unwrap();
+        assert!(result.geometric_error.is_finite());
+        for (edge, value) in result.q.iter().enumerate() {
+            assert!(
+                (lower[edge] - 1e-7..=upper[edge] + 1e-7).contains(value),
+                "solve_for_q={solve_for_q}, edge={edge}, q={value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn singular_mixed_sign_cancellation_is_rejected() {
+    let (problem, target) = duplicate_edge_problem();
+    let error = geometric_error_vector(&problem, &target, &[1.0, -1.0])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("nonsingular") || error.contains("factorization"),
+        "{error}"
+    );
+}
+
+#[test]
+fn geometric_exact_stage_one_is_converged_without_a_step() {
+    let (problem, _) = arch_problem(false);
+    let q = vec![1.0; 8];
+    let (target, _) = forward_target(&problem, &q);
+    let mut opts = geometric_opts(
+        InverseMetric::Geometry,
+        ParticularMethod::Clarabel,
+        LinearAlgebra::Direct,
+        0.0,
+    );
+    opts.q_ref = q;
+    opts.max_outer = 1;
+    let result = solve_inverse_fdm(&problem, &target, opts).unwrap();
+    assert!(result.converged);
+    assert_eq!(result.iterations, 0);
+    assert!(result.geometric_error < 1e-10);
+}
+
+#[test]
+fn geometric_blocked_step_is_not_reported_converged() {
+    let (problem, _) = arch_problem(false);
+    let q = vec![1.0; 8];
+    let (funicular, _) = forward_target(&problem, &q);
+    let target = perturb(&funicular, 0.02);
+    let mut opts = geometric_opts(
+        InverseMetric::Geometry,
+        ParticularMethod::Clarabel,
+        LinearAlgebra::Direct,
+        0.0,
+    );
+    opts.q_ref = q.clone();
+    opts.lower = q.clone();
+    opts.upper = q;
+    opts.max_outer = 1;
+    let result = solve_inverse_fdm(&problem, &target, opts).unwrap();
+    assert!(!result.converged);
+    assert!(result.geometric_error > 1e-8);
+}
+
+#[test]
+fn frozen_cwls_honors_a_single_update_budget() {
+    let (problem, known_q) = square_grid_problem(4);
+    let (funicular, _) = forward_target(&problem, &known_q);
+    let target = jitter_z(&funicular);
+    let mut opts = geometric_opts(
+        InverseMetric::Geometry,
+        ParticularMethod::Clarabel,
+        LinearAlgebra::Direct,
+        1e-8,
+    );
+    opts.max_outer = 1;
+    opts.tol = 1e-12;
+    let result = solve_inverse_fdm(&problem, &target, opts).unwrap();
+    assert_eq!(result.iterations, 1);
+}
+
+#[test]
+fn geometry_newton_honors_a_budget_above_the_default() {
+    let (problem, known_q) = square_grid_problem(4);
+    let (funicular, _) = forward_target(&problem, &known_q);
+    let target = jitter_z(&funicular);
+    let mut opts = geometric_opts(
+        InverseMetric::GeometryNewton,
+        ParticularMethod::Clarabel,
+        LinearAlgebra::Direct,
+        1e-8,
+    );
+    opts.max_outer = DEFAULT_MAX_OUTER + 2;
+    opts.tol = 1e-12;
+    let requested = opts.max_outer;
+    let result = solve_inverse_fdm(&problem, &target, opts).unwrap();
+    assert!(
+        result.iterations > DEFAULT_MAX_OUTER,
+        "requested {} updates, but only {} ran",
+        requested,
+        result.iterations
+    );
+    assert!(result.iterations <= requested);
+}
+
+#[test]
+fn public_q_bounds_hold_for_q_and_member_force_stage_one() {
+    let (problem, _) = triangle_problem();
+    let (target, _) = forward_target(&problem, &[2.0, 3.0]);
+    for solve_for_q in [true, false] {
+        let mut opts = inverse_opts(
+            0.0,
+            true,
+            ParticularMethod::Clarabel,
+            LinearAlgebra::Direct,
+            solve_for_q,
+        );
+        opts.lower = vec![2.5];
+        opts.upper = vec![2.75];
+        let result = solve_inverse_fdm(&problem, &target, opts).unwrap();
+        assert!(
+            result
+                .q
+                .iter()
+                .all(|q| (2.5 - 1e-7..=2.75 + 1e-7).contains(q)),
+            "solve_for_q={solve_for_q}: {:?}",
+            result.q
+        );
+    }
+}
+
+#[test]
+#[ignore = "manual release benchmark; run with --release --ignored --nocapture"]
+fn benchmark_staged_inverse_21_by_21_nodes() {
+    let (problem, q) = square_grid_problem(21);
+    let (funicular, _) = forward_target(&problem, &q);
+    let target = jitter_z(&funicular);
+    for (metric, updates) in std::iter::once((InverseMetric::Force, 0)).chain(
+        [InverseMetric::Geometry, InverseMetric::GeometryNewton]
+            .into_iter()
+            .flat_map(|metric| (1..=3).map(move |updates| (metric, updates))),
+    ) {
+        let mut opts = inverse_opts(
+            1e-8,
+            true,
+            ParticularMethod::Clarabel,
+            LinearAlgebra::Direct,
+            false,
+        );
+        opts.metric = metric;
+        opts.max_outer = updates.max(1);
+        opts.lower = vec![1e-3];
+        opts.upper = vec![100.0];
+        let started = Instant::now();
+        let result = solve_inverse_fdm(&problem, &target, opts).unwrap();
+        eprintln!(
+            "staged-grid,metric={metric:?},updates={updates},nodes=441,edges={},total_ms={:.3},iterations={},error={:.6e}",
+            problem.topology.num_edges,
+            started.elapsed().as_secs_f64() * 1e3,
+            result.iterations,
+            result.geometric_error
         );
     }
 }

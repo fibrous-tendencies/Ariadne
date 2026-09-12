@@ -786,9 +786,9 @@ public sealed class TheseusSolver : IDisposable
     /// (Direct unconstrained only; constrained Direct always uses Clarabel).
     /// linearAlgebra: 0 = Direct, 1 = Iterative.
     /// metric: 0 = Force (min ‖Mx − p‖), 1 = Geometry, 2 = GeometryNewton.
-    /// Geometric metrics weight the equilibrium rows by the Laplacian
-    /// compliance so the solve targets ‖x(q) − x*‖; they reject Gram, sparse
-    /// QR, and L1. A null qRef seeds the outer loop from the handle's q.
+    /// solveForQ selects only the Stage-1 particular coordinate. Geometric
+    /// Stage 2 always refines q using the Laplacian compliance. Gram and sparse
+    /// QR can initialize Stage 2 but L1 remains unsupported there.
     public SolverResult SolveInverseFdm(
         double[] targetFreeXyz, double regularization,
         bool useL2 = true, int maxL1Iter = 20, int particularMethod = 3,
@@ -797,7 +797,8 @@ public sealed class TheseusSolver : IDisposable
         bool enforceZeroRz = false, bool solveForQ = true,
         int[]? signs = null, double[]? lower = null, double[]? upper = null,
         int maxIter = 500, double tol = 1e-6,
-        int metric = 0, double[]? qRef = null, int maxOuter = 0)
+        int metric = 0, double[]? qRef = null, int maxOuter = 0,
+        double cwlsDamping = 1e-6)
     {
         ThrowIfDisposed();
         var q = new double[_numEdges];
@@ -812,8 +813,8 @@ public sealed class TheseusSolver : IDisposable
         double[] lowerArr = lower ?? [];
         double[] upperArr = upper ?? [];
 
-        Check(TheseusInterop.theseus_solve_inverse_fdm_metric(
-            _handle, targetFreeXyz, regularization,
+        Check(TheseusInterop.theseus_solve_inverse_fdm_metric_cwls(
+            _handle, targetFreeXyz, regularization, cwlsDamping,
             useL2 ? 1 : 0, (nuint)maxL1Iter, particularMethod, linearAlgebra,
             enforceZeroRx ? 1 : 0, enforceZeroRy ? 1 : 0,
             enforceZeroRz ? 1 : 0, solveForQ ? 1 : 0,

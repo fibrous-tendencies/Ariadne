@@ -1,9 +1,10 @@
 //! Inverse FDM solvers: find force densities q from a target geometry.
 //!
-//! Direct unconstrained particulars use Gram, the saddle (Moore--Penrose /
-//! Tikhonov), or sparse QR. Iterative unconstrained uses LSQR. A finite box
-//! (signs and/or bounds) uses Clarabel (Direct) or spectral projected
-//! gradient (Iterative). `L2 = false` wraps any inner in IRLS.
+//! Stage 1 computes the selected force-residual particular in either force
+//! density or member-force coordinates. Geometric metrics then run a separate
+//! Stage 2 in force-density coordinates, weighted by the FDM compliance.
+//! Public signs and bounds always constrain force density, including when
+//! Stage 1 uses member force.
 
 use crate::nullspace::{
     apply_pseudoinverse, solve_lsqr, solve_saddle_pseudoinverse, EquilibriumSystem,
@@ -38,22 +39,24 @@ pub enum LinearAlgebra {
 
 /// Which residual the inverse solve minimises.
 ///
-/// The FDM residual at a frozen target is the geometric error pre-conditioned
-/// by the Laplacian: `r(q) = E(x*)q - p = D(q)(x* - x(q))`, so
-/// `x(q) - x* = -D(q)^-1 r(q)`.  `Force` minimises `‖r‖` and therefore treats
-/// every nodal force error alike; the geometric variants minimise `‖D^-1 r‖`,
-/// which is the distance the forward solve actually lands from the target.
+/// In the free-node rows, the FDM residual at a frozen target is the geometric
+/// error pre-conditioned by the Laplacian:
+/// `r(q) = E(x*)q - p = D(q)(x* - x(q))`, so
+/// `x(q) - x* = -D(q)^-1 r(q)`. `Force` returns the selected Stage-1
+/// particular. The geometric variants then perform a short q-space
+/// compliance-weighted warm start before downstream nonlinear refinement.
+/// Positive q uses Cholesky; all-compression and mixed-sign q use sparse LDL
+/// and are valid when the current D is numerically invertible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InverseMetric {
-    /// Minimise `‖Mx - p‖`. Historical behaviour.
+    /// Return the selected q- or member-force Stage-1 particular.
     #[default]
     Force = 0,
-    /// Minimise the geometric error with the Jacobian frozen at the target,
-    /// `E(x*)`. One weighted least-squares solve per outer iteration.
+    /// Apply CWLS warm-start updates with the Jacobian frozen at `E(x*)`.
     Geometry = 1,
-    /// Minimise the geometric error with the Jacobian re-assembled at the
-    /// current form-found geometry `x(q_k)`. True Gauss--Newton; costs no
-    /// forward solve because `x(q_k) = x* - D(q_k)^-1 r(q_k)`.
+    /// Apply q-space Gauss--Newton warm-start updates with the Jacobian
+    /// re-assembled at `x(q_k)`. This costs no forward solve because
+    /// `x(q_k) = x* - D(q_k)^-1 r(q_k)`.
     GeometryNewton = 2,
 }
 
@@ -94,7 +97,7 @@ impl TryFrom<i32> for LinearAlgebra {
     }
 }
 
-/// Per-edge box on the inverse unknown (q or t).
+/// Per-edge box. Public inverse-FDM boxes are always expressed in q.
 #[derive(Debug, Clone)]
 pub struct BoxBounds {
     pub lower: Vec<f64>,
@@ -125,6 +128,7 @@ pub struct InverseFdmOptions {
     pub enforce_zero_rx: bool,
     pub enforce_zero_ry: bool,
     pub enforce_zero_rz: bool,
+    /// Stage-1 coordinate only. Stage-2 CWLS always operates in q.
     pub solve_for_q: bool,
     pub signs: Vec<i32>,
     pub lower: Vec<f64>,
@@ -134,11 +138,13 @@ pub struct InverseFdmOptions {
     /// Residual metric. `Force` reproduces the historical solve exactly.
     pub metric: InverseMetric,
     /// Reference force densities that seed the geometric outer loop. Empty
-    /// derives `q_e = 1 / L_e` from the target edge lengths. Ignored by
-    /// `InverseMetric::Force`.
+    /// uses the Stage-1 particular. This is an internal test override and is
+    /// ignored by `InverseMetric::Force`.
     pub q_ref: Vec<f64>,
-    /// Outer iteration budget for the geometric metrics.
+    /// Maximum CWLS update count. Geometric solves stop earlier at tolerance.
     pub max_outer: usize,
+    /// Stage-2 damping in force-density coordinates.
+    pub cwls_damping: f64,
 }
 
 impl InverseFdmOptions {
@@ -170,12 +176,13 @@ impl InverseFdmOptions {
             metric: InverseMetric::Force,
             q_ref: Vec::new(),
             max_outer: DEFAULT_MAX_OUTER,
+            cwls_damping: 1e-6,
         }
     }
 }
 
-/// Default outer iteration budget for the geometric metrics.
-pub const DEFAULT_MAX_OUTER: usize = 8;
+/// Default Gauss--Newton CWLS iteration budget.
+pub const DEFAULT_MAX_OUTER: usize = 3;
 
 /// Result of an inverse-FDM particular (force densities at the target).
 #[derive(Debug, Clone)]
@@ -233,9 +240,9 @@ fn gram_ldl_solve(
 ) -> Result<Vec<f64>, TheseusError> {
     match ldl_solve(g, rhs) {
         Ok(sol) => Ok(sol),
-        Err(_) if regularization == 0.0 => Err(TheseusError::Solver(
-            "Gram at λ=0: MᵀM is singular".into(),
-        )),
+        Err(_) if regularization == 0.0 => {
+            Err(TheseusError::Solver("Gram at λ=0: MᵀM is singular".into()))
+        }
         Err(error) => Err(error),
     }
 }

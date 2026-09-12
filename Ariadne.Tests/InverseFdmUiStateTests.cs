@@ -9,6 +9,9 @@ public sealed class InverseFdmUiStateTests
     public void ClarabelIsTheDefaultDirectSelection()
     {
         Assert.Equal(ParticularMode.Clarabel, InverseFdmUiState.DefaultParticular);
+        Assert.Equal(MetricMode.Geometric, InverseFdmUiState.DefaultMetric);
+        Assert.Equal(3, InverseFdmUiState.DefaultGnIterations);
+        Assert.False(InverseFdmUiState.DefaultSolveForQ);
         Assert.Equal(3, InverseFdmUiState.NativeParticularMethod(ParticularMode.Clarabel));
         Assert.Equal(
             ActiveInverseEngine.Clarabel,
@@ -29,6 +32,16 @@ public sealed class InverseFdmUiStateTests
         Assert.True(InverseFdmUiState.HasEffectiveBounds([0, 1], [], []));
         Assert.True(InverseFdmUiState.HasEffectiveBounds([], [-2.0], []));
         Assert.True(InverseFdmUiState.HasEffectiveBounds([], [], [3.0]));
+    }
+
+    [Fact]
+    public void StrictSignDefiniteBoundsSuppressOnlyTheSingularityWarning()
+    {
+        Assert.True(InverseFdmUiState.HasStrictSignDefiniteBounds([0.1, 2.0], []));
+        Assert.True(InverseFdmUiState.HasStrictSignDefiniteBounds([], [-0.1, -2.0]));
+        Assert.False(InverseFdmUiState.HasStrictSignDefiniteBounds([0.0], []));
+        Assert.False(InverseFdmUiState.HasStrictSignDefiniteBounds([], [0.0]));
+        Assert.False(InverseFdmUiState.HasStrictSignDefiniteBounds([-2.0], [3.0]));
     }
 
     [Theory]
@@ -105,9 +118,9 @@ public sealed class InverseFdmUiStateTests
     [Theory]
     [InlineData(3)] // Gram
     [InlineData(2)] // QrLeastSquares
-    public void GeometricMetricRejectsDensifyingDirectSolvers(int particularValue)
+    public void GramAndQrCanInitializeIndependentGeometricStage(int particularValue)
     {
-        Assert.False(InverseFdmUiState.SupportsGeometricMetric(
+        Assert.True(InverseFdmUiState.SupportsGeometricMetric(
             LinearAlgebraMode.Direct,
             (ParticularMode)particularValue,
             hasEffectiveBounds: false));
@@ -144,10 +157,17 @@ public sealed class InverseFdmUiStateTests
     }
 
     [Fact]
-    public void MetricModeValuesMatchTheNativeAbi()
+    public void GnIterationsSelectNativeMetricAndBudget()
     {
-        Assert.Equal(0, (int)MetricMode.Force);
-        Assert.Equal(1, (int)MetricMode.Geometry);
-        Assert.Equal(2, (int)MetricMode.GeometryNewton);
+        Assert.Equal(0, InverseFdmUiState.NativeMetric(MetricMode.Force, 3));
+        Assert.Equal(1, InverseFdmUiState.NativeMetric(MetricMode.Geometric, 0));
+        Assert.Equal(1, InverseFdmUiState.NativeMetric(MetricMode.Geometric, -1));
+        Assert.Equal(2, InverseFdmUiState.NativeMetric(MetricMode.Geometric, 1));
+        Assert.Equal(2, InverseFdmUiState.NativeMetric(MetricMode.Geometric, 500));
+
+        Assert.Equal(0, InverseFdmUiState.GeometricIterationBudget(MetricMode.Force, 3));
+        Assert.Equal(1, InverseFdmUiState.GeometricIterationBudget(MetricMode.Geometric, 0));
+        Assert.Equal(1, InverseFdmUiState.GeometricIterationBudget(MetricMode.Geometric, -1));
+        Assert.Equal(500, InverseFdmUiState.GeometricIterationBudget(MetricMode.Geometric, 500));
     }
 }

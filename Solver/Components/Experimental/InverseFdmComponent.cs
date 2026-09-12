@@ -24,10 +24,12 @@ public class InverseFdmComponent : GH_Component
     private const string MetricKey = "InverseFdmMetric";
     private ParticularMode _particular = InverseFdmUiState.DefaultParticular;
     private LinearAlgebraMode _linearAlgebra = LinearAlgebraMode.Direct;
-    private MetricMode _metric = MetricMode.Force;
+    private MetricMode _metric = InverseFdmUiState.DefaultMetric;
     private double _lambda = 1e-6;
+    private double _cwlsDamping = 1e-6;
+    private int _gnIterations = InverseFdmUiState.DefaultGnIterations;
     private bool _useL2 = true;
-    private bool _solveForQ = false;
+    private bool _solveForQ = InverseFdmUiState.DefaultSolveForQ;
     private bool _hasBox;
 
     public InverseFdmComponent()
@@ -44,24 +46,25 @@ public class InverseFdmComponent : GH_Component
         pManager.AddPointParameter("Target Points", "Target", "Desired free-node positions (one per free node, matching order)", GH_ParamAccess.list);
         pManager.AddVectorParameter("Loads", "Loads", "Loads on free nodes", GH_ParamAccess.list, new Vector3d(0, 0, -1));
         pManager.AddPointParameter("Load Nodes", "LN", "Nodes to apply loads to (optional; if empty, loads apply to all free nodes)", GH_ParamAccess.list);
-        pManager.AddNumberParameter("Regularization", "λ", "Damping used by Tikhonov, Gram, LSQR, Clarabel, and SPG. Ignored for Moore–Penrose and QR. Gram at λ = 0 is unregularized (MᵀM) and may fail if singular.", GH_ParamAccess.item, 1e-6);
+        pManager.AddNumberParameter("Regularization", "λ", "Stage-1 particular regularization used by Tikhonov, Gram, LSQR, Clarabel, and SPG. Ignored for Moore–Penrose and QR.", GH_ParamAccess.item, 1e-6);
         pManager.AddBooleanParameter("L2", "L2", "True = L2 least-squares residual, False = L1 absolute residual (IRLS around the inner solver)", GH_ParamAccess.item, true);
-        pManager.AddIntegerParameter("L1 Iterations", "L1Iter", "Maximum IRLS outer iterations when L2 is false", GH_ParamAccess.item, 20);
+        pManager.AddIntegerParameter("Gauss–Newton Iterations", "GNiter", "Geometric metric only: 0 runs one frozen-target CWLS update; a positive value is the maximum number of CWLS-GN updates. Stops early at Tol.", GH_ParamAccess.item, InverseFdmUiState.DefaultGnIterations);
         pManager.AddBooleanParameter("Enforce Rx=0", "Rx0", "Strictly enforce zero X-reaction at supports", GH_ParamAccess.item, false);
         pManager.AddBooleanParameter("Enforce Ry=0", "Ry0", "Strictly enforce zero Y-reaction at supports", GH_ParamAccess.item, false);
         pManager.AddBooleanParameter("Enforce Rz=0", "Rz0", "Strictly enforce zero Z-reaction at supports", GH_ParamAccess.item, false);
-        pManager.AddBooleanParameter("Solve Q", "SolveQ", "True = solve for force densities q. False = solve for member forces t, then recover q = t / L", GH_ParamAccess.item, false);
+        pManager.AddBooleanParameter("Solve Q", "SolveQ", "Stage 1 only: True solves the initial particular in force densities q. False (default) solves member forces t, then recovers q = t / target length. CWLS and L-BFGS-B operate in q.", GH_ParamAccess.item, InverseFdmUiState.DefaultSolveForQ);
         pManager.AddIntegerParameter("Signs", "Signs",
-            "+1 tension (x ≥ 0), -1 compression (x ≤ 0), 0 free. Match/graft to the edge tree; one value broadcasts globally or within its branch. Unconnected = unconstrained.",
+            "+1 tension (q ≥ 0), -1 compression (q ≤ 0), 0 free. Bounds always apply to q, even when Stage 1 solves member forces.",
             GH_ParamAccess.tree);
         pManager.AddNumberParameter("Lower", "Lower",
-            "Lower bound on the inverse unknown (q or t). Match/graft to the edge tree; one value broadcasts globally or within its branch. Unconnected = −∞.",
+            "Lower bound on q. For a force-space Stage 1 this is internally multiplied by target edge length.",
             GH_ParamAccess.tree);
         pManager.AddNumberParameter("Upper", "Upper",
-            "Upper bound on the inverse unknown (q or t). Match/graft to the edge tree; one value broadcasts globally or within its branch. Unconnected = +∞.",
+            "Upper bound on q. For a force-space Stage 1 this is internally multiplied by target edge length.",
             GH_ParamAccess.tree);
-        pManager.AddIntegerParameter("Max Iterations", "MaxIter", "Iteration budget per inner solve for SPG and LSQR", GH_ParamAccess.item, 500);
-        pManager.AddNumberParameter("Tolerance", "Tol", "Convergence tolerance for SPG and LSQR", GH_ParamAccess.item, 1e-6);
+        pManager.AddIntegerParameter("Max Iterations", "MaxIter", "Iteration budget per inner solve for Clarabel, SPG, and LSQR", GH_ParamAccess.item, 500);
+        pManager.AddNumberParameter("Tolerance", "Tol", "Convergence tolerance for Clarabel, SPG, and LSQR", GH_ParamAccess.item, 1e-6);
+        pManager.AddNumberParameter("CWLS Damping", "λcwls", "Stage-2 Levenberg–Marquardt damping λcwls‖Δq‖². Separate from Stage-1 particular regularization.", GH_ParamAccess.item, 1e-6);
         pManager[3].Optional = true;
         pManager[11].Optional = true;
         pManager[12].Optional = true;
@@ -92,7 +95,8 @@ public class InverseFdmComponent : GH_Component
         List<Point3d> loadNodes = [];
         double regularization = 1e-6;
         bool useL2 = true;
-        int maxL1Iter = 20;
+        const int maxL1Iter = 20;
+        int gnIterations = InverseFdmUiState.DefaultGnIterations;
         bool enforceZeroRx = false;
         bool enforceZeroRy = false;
         bool enforceZeroRz = false;
@@ -102,6 +106,7 @@ public class InverseFdmComponent : GH_Component
         var upperTree = new GH_Structure<GH_Number>();
         int maxIter = 500;
         double tol = 1e-6;
+        double cwlsDamping = 1e-6;
 
         if (!DA.GetData(0, ref network)) return;
         if (!DA.GetDataList(1, targetPoints)) return;
@@ -109,7 +114,7 @@ public class InverseFdmComponent : GH_Component
         DA.GetDataList(3, loadNodes);
         DA.GetData(4, ref regularization);
         DA.GetData(5, ref useL2);
-        DA.GetData(6, ref maxL1Iter);
+        DA.GetData(6, ref gnIterations);
         DA.GetData(7, ref enforceZeroRx);
         DA.GetData(8, ref enforceZeroRy);
         DA.GetData(9, ref enforceZeroRz);
@@ -119,8 +124,11 @@ public class InverseFdmComponent : GH_Component
         DA.GetDataTree(13, out upperTree);
         DA.GetData(14, ref maxIter);
         DA.GetData(15, ref tol);
+        DA.GetData(16, ref cwlsDamping);
 
         _lambda = regularization;
+        _cwlsDamping = cwlsDamping;
+        _gnIterations = Math.Max(0, gnIterations);
         _useL2 = useL2;
         _solveForQ = solveForQ;
 
@@ -176,16 +184,8 @@ public class InverseFdmComponent : GH_Component
             return;
         }
 
-        if (_metric != MetricMode.Force)
+        if (_metric == MetricMode.Geometric)
         {
-            if (!InverseFdmUiState.SupportsGeometricMetric(_linearAlgebra, _particular, _hasBox))
-            {
-                AddRuntimeMessage(GH_RuntimeMessageLevel.Error,
-                    "The geometric metric cannot use Gram or QR least squares: both would need the "
-                    + "compliance-weighted matrix formed explicitly, which is dense. Choose Clarabel, "
-                    + "Moore–Penrose, or Tikhonov, or switch Linear algebra to Iterative.");
-                return;
-            }
             if (!useL2)
             {
                 AddRuntimeMessage(GH_RuntimeMessageLevel.Error,
@@ -193,12 +193,12 @@ public class InverseFdmComponent : GH_Component
                     + "has no agreed meaning once the rows carry the Laplacian compliance.");
                 return;
             }
-            if (!HasPositiveLowerBound(signs, lower))
+            if (!InverseFdmUiState.HasStrictSignDefiniteBounds(lower, upper))
             {
                 AddRuntimeMessage(GH_RuntimeMessageLevel.Warning,
-                    "The geometric metric weights by the FDM Laplacian, which is only invertible for "
-                    + "strictly positive q. Set Signs = +1 or a positive Lower bound, or the solve may "
-                    + "fail on a singular compliance.");
+                    "CWLS requires a numerically invertible FDM Laplacian. Mixed-sign and "
+                    + "all-compression q are supported through sparse LDLᵀ, but cancellation, zero "
+                    + "densities, or an unstable unpivoted factorization can block a trial.");
             }
         }
 
@@ -237,17 +237,22 @@ public class InverseFdmComponent : GH_Component
                 : regularization;
             int particularMethod = InverseFdmUiState.NativeParticularMethod(_particular);
 
+            int nativeMetric = InverseFdmUiState.NativeMetric(_metric, _gnIterations);
+            int maxOuter = InverseFdmUiState.GeometricIterationBudget(_metric, _gnIterations);
             var result = TheseusSolverService.SolveInverseFdm(
                 network, inputs, targetFreeXyz, effectiveRegularization,
                 useL2, maxL1Iter, particularMethod, (int)_linearAlgebra,
                 enforceZeroRx, enforceZeroRy, enforceZeroRz, solveForQ,
                 [.. signs], [.. lower], [.. upper], maxIter, tol,
-                (int)_metric);
+                nativeMetric, maxOuter, cwlsDamping);
 
-            if (_hasBox && _linearAlgebra == LinearAlgebraMode.Iterative && !result.Converged)
+            if (_metric == MetricMode.Force
+                && _hasBox
+                && _linearAlgebra == LinearAlgebraMode.Iterative
+                && !result.Converged)
             {
                 AddRuntimeMessage(GH_RuntimeMessageLevel.Warning,
-                    $"SPG did not converge in {result.Iterations} iterations.");
+                    $"SPG did not converge within MaxIter={maxIter}.");
             }
 
             var packedLoads = TheseusSolverService.PackFreeNodeLoads(
@@ -364,8 +369,7 @@ public class InverseFdmComponent : GH_Component
         Menu_AppendSeparator(menu);
         var metricMenu = new ToolStripMenuItem("Metric");
         AppendMetricItem(metricMenu, "Force residual", MetricMode.Force);
-        AppendMetricItem(metricMenu, "Geometric (frozen target)", MetricMode.Geometry);
-        AppendMetricItem(metricMenu, "Geometric (Gauss–Newton)", MetricMode.GeometryNewton);
+        AppendMetricItem(metricMenu, "Geometric residual", MetricMode.Geometric);
         menu.Items.Add(metricMenu);
         Menu_AppendSeparator(menu);
         Menu_AppendItem(menu, "Linear algebra: Direct", (_, _) => SetLinearAlgebra(LinearAlgebraMode.Direct), true, _linearAlgebra == LinearAlgebraMode.Direct);
@@ -394,17 +398,6 @@ public class InverseFdmComponent : GH_Component
         };
         item.Click += (_, _) => SetParticular(mode);
         parent.DropDownItems.Add(item);
-    }
-
-    /// <summary>
-    /// True when every edge is pinned to positive q, which is what makes the
-    /// FDM Laplacian positive definite and its compliance well defined.
-    /// </summary>
-    private static bool HasPositiveLowerBound(IReadOnlyList<int> signs, IReadOnlyList<double> lower)
-    {
-        bool allTension = signs.Count > 0 && signs.All(sign => sign > 0);
-        bool allPositiveLower = lower.Count > 0 && lower.All(value => value > 0.0);
-        return allTension || allPositiveLower;
     }
 
     private void AppendMetricItem(ToolStripMenuItem parent, string label, MetricMode mode)
@@ -449,7 +442,7 @@ public class InverseFdmComponent : GH_Component
     private void UpdateMessage()
     {
         string residual = _useL2 ? "L2" : "L1";
-        string unknown = _solveForQ ? "q" : "t";
+        string unknown = _solveForQ ? "q-init" : "t-init";
         ActiveInverseEngine engine = InverseFdmUiState.ResolveEngine(
             _linearAlgebra, _particular, _hasBox);
         string engineLabel = engine switch
@@ -465,8 +458,10 @@ public class InverseFdmComponent : GH_Component
         };
         string metricLabel = _metric switch
         {
-            MetricMode.Geometry => " · Geom",
-            MetricMode.GeometryNewton => " · GeomGN",
+            MetricMode.Geometric when _gnIterations == 0 =>
+                $" · CWLS λ={FormatLambda(_cwlsDamping)}",
+            MetricMode.Geometric =>
+                $" · CWLS-GN×{_gnIterations} λ={FormatLambda(_cwlsDamping)}",
             _ => "",
         };
         Message = $"{engineLabel} · {residual} · {unknown}{metricLabel}";
@@ -492,8 +487,8 @@ public class InverseFdmComponent : GH_Component
             _particular = (ParticularMode)reader.GetInt32(ParticularKey);
         if (reader.ItemExists(LinearAlgebraKey) && Enum.IsDefined(typeof(LinearAlgebraMode), reader.GetInt32(LinearAlgebraKey)))
             _linearAlgebra = (LinearAlgebraMode)reader.GetInt32(LinearAlgebraKey);
-        if (reader.ItemExists(MetricKey) && Enum.IsDefined(typeof(MetricMode), reader.GetInt32(MetricKey)))
-            _metric = (MetricMode)reader.GetInt32(MetricKey);
+        if (reader.ItemExists(MetricKey))
+            _metric = reader.GetInt32(MetricKey) == 0 ? MetricMode.Force : MetricMode.Geometric;
         UpdateMessage();
         return base.Read(reader);
     }
@@ -515,9 +510,11 @@ It is <b>not</b> the inverse of the square form-finding matrix <code>A(q)</code>
 <h2>When to bound the particular</h2>
 <p>
 A flat or nearly-flat plate cannot carry out-of-plane load with in-plane members.
-Unconstrained least squares then produces huge <code>q</code> or <code>t</code>.
-Connect <b>Signs</b> and/or <b>Lower / Upper</b> to cap the particular; RelRes will
-not go to 0 when the target is inconsistent with the box.
+Unconstrained least squares can then produce huge <code>q</code> or <code>t</code>.
+<b>Signs</b>, <b>Lower</b>, and <b>Upper</b> always constrain force density q.
+When Stage 1 solves member force, the component transforms the q box with
+<code>t = L* q</code>. RelRes will not go to 0 when the target is inconsistent
+with the box.
 </p>
 <p>
 These bounds clip the least-squares particular. They are <b>not</b> the
@@ -530,25 +527,26 @@ self-stress.
 <h2>Metric (right-click)</h2>
 <p>
 Choosing what to minimise matters more than choosing a solver. In FDM the force
-residual at a frozen target is the geometric error pre-conditioned by the
-Laplacian:
+residual in the free-node rows at a frozen target is the geometric error
+pre-conditioned by the Laplacian:
 </p>
 <p>
 <code>r(q) = E(x*)q − p = D(q)(x* − x(q))</code>, so
 <code>x(q) − x* = −D(q)⁻¹ r(q)</code>.
 </p>
 <ul>
-<li><b>Force residual (default)</b> — minimises <code>‖r‖</code>. Every nodal
+<li><b>Force residual</b> — returns the selected Stage-1 particular without a
+compliance-weighted update. It minimises <code>‖r‖</code>. Every nodal
 force error counts the same regardless of how flexible that node is, so a small
 RelRes can still forward-solve far from the target. This is the historical
 behaviour and the right choice for a rigidity/particular question.</li>
-<li><b>Geometric (frozen target)</b> — minimises <code>‖D⁻¹r‖</code>, weighting
-each row by the compliance, with the Jacobian held at <code>x*</code>. An outer
-loop refreshes <code>D</code> at the current q.</li>
-<li><b>Geometric (Gauss–Newton)</b> — same weighting, but the Jacobian is
-re-assembled at the current form-found geometry <code>x(q_k)</code>. This is the
-true Gauss–Newton step for <code>‖x(q) − x*‖</code> and costs no forward solve,
-because <code>x(q_k) = x* − D⁻¹r_k</code>.</li>
+<li><b>Geometric residual (default)</b> — applies compliance-weighted
+least-squares (CWLS) warm-start updates in q. <b>GNiter = 0</b> performs one
+frozen-target update with the Jacobian held at <code>x*</code>. A positive
+<b>GNiter</b> performs up to that many Gauss–Newton updates, rebuilding the
+Jacobian at <code>x(q_k)</code> and stopping early at Tol. These are true
+Gauss–Newton steps for <code>‖x(q) − x*‖</code> and need no forward solve because
+<code>x(q_k) = x* − D⁻¹r_k</code>.</li>
 </ul>
 <p>
 Use a geometric metric when you want a <b>warm start</b>: a q whose form-found
@@ -556,26 +554,35 @@ shape lands near the target. Use Force when you want the particular that best
 closes equilibrium at the frozen shape.
 </p>
 <p>
-The geometric metrics require <b>L2 = true</b> and a particular that can be
-left-weighted without densifying: Clarabel, Moore–Penrose, Tikhonov, LSQR, or
-SPG. <b>Gram and QR are rejected</b>, since both would need <code>S⁻¹M</code>
-formed explicitly. They also need <b>strictly positive q</b> (Signs = +1 or a
-positive Lower) so the Laplacian is invertible, and geometry-independent loads.
+CWLS requires <b>L2 = true</b>, geometry-independent loads, and nonsingular
+<code>D(q)</code>. Positive q guarantees a positive-definite Laplacian on a
+properly anchored connected net. Mixed-sign and all-compression q are supported
+with sparse LDLᵀ when D is nonsingular and numerically factorizable under the
+current ordering; indefiniteness itself is not an error.
+Gram and QR may generate Stage 1, while Stage 2 independently selects a
+left-weightable backend.
 </p>
 <p>
-λ becomes Levenberg–Marquardt damping on the step, and the q wire seeds the
-outer loop. <b>GeomErr</b> reports <code>‖x(q) − x*‖</code> for every metric, so
-Force and Geometric runs are directly comparable.
+<b>Regularization λ</b> applies only to the Stage-1 particular.
+<b>CWLS Damping λcwls</b> applies Levenberg–Marquardt damping
+<code>λcwls‖Δq‖²</code> to Stage 2. The geometric objective is nonconvex even
+though each inner CWLS problem is convex. <b>GeomErr</b> reports
+<code>‖x(q) − x*‖</code> for every metric.
 </p>
 
 <br/>
 
 <h2>Linear algebra (right-click)</h2>
+<p>
+The particular and linear-algebra menus select Stage 1. Stage 2 always works
+in q and dispatches independently.
+</p>
 <ul>
 <li><b>Direct</b> — uses the selected Direct solver when unconstrained.
-A nonzero Sign or finite bound selects and retains Clarabel.</li>
+A nonzero Sign or finite q bound selects Clarabel. Bounded CWLS also uses
+Clarabel; unbounded CWLS uses the weighted saddle system.</li>
 <li><b>Iterative</b> — uses LSQR when unconstrained and SPG with a nonzero Sign
-or finite bound. The Direct solver menu is inactive.</li>
+or finite q bound, in both stages. The Direct solver menu is inactive.</li>
 </ul>
 <p>
 Connected ±∞ bounds do not constrain the solve.
@@ -606,10 +613,10 @@ Bounded Iterative uses SPG and λ.
 
 <h2>L1 / IRLS</h2>
 <p>
-<code>L2 = false</code> wraps <b>every</b> inner solver in iteratively reweighted least
-squares. That is still weighted L2, not a linear program. Bound + IRLS is not
-exact ℓ₁ with bounds. <code>L1Iter</code> is the outer count; MaxIter / Tol apply to
-each SPG or LSQR inner solve.
+For the Force metric, <code>L2 = false</code> wraps the Stage-1 inner solver in
+iteratively reweighted least squares with an internal iteration budget. That is
+still weighted L2, not a linear program. Bound + IRLS is not exact ℓ₁ with
+bounds. The Geometric metric requires <code>L2 = true</code>.
 </p>
 
 <br/>
@@ -619,15 +626,22 @@ each SPG or LSQR inner solve.
 <li><b>Loads / Load Nodes</b> — with no Load Nodes, loads apply to all free nodes in order
 (the last load repeats if needed). With Load Nodes, one load broadcasts to every listed node,
 or provide one load per listed node; unlisted free nodes receive zero load.</li>
-<li><b>SolveQ</b> — True solves for force densities <code>q</code>. False solves for member forces
-<code>t</code>, then recovers <code>q = t / L</code>.</li>
 <li><b>Rx0 / Ry0 / Rz0</b> — independently force zero support reaction in X, Y, and/or Z.</li>
-<li><b>Signs / Lower / Upper</b> — intersected per edge. Match or graft to the
-edge tree the same way as Theseus <code>qMin</code> / <code>qMax</code>: one value
-broadcasts globally, one value on a branch repeats for every edge on that branch,
-or supply one value per edge. Empty Signs and disconnected Lower / Upper is
-unconstrained. Error if an interval is empty.</li>
-<li><b>MaxIter / Tol</b> — SPG and LSQR only. Clarabel uses its interior-point defaults.</li>
+<li><b>GNiter</b> — Geometric metric only. 0 runs one frozen-target CWLS update.
+A positive integer runs at most that many CWLS-GN updates; Tol may stop them
+earlier. The default is 3. Force ignores this input.</li>
+<li><b>SolveQ</b> — controls Stage 1 only. False (default) solves member forces
+<code>t</code> using unit directions and converts <code>q=t/L*</code>; True
+solves the initial particular directly in q. CWLS and downstream L-BFGS-B
+always operate in q.</li>
+<li><b>Signs / Lower / Upper</b> — always constrain q. A force-space Stage 1
+multiplies the bounds by positive target edge lengths. Match or graft to the
+edge tree: one value broadcasts globally or within a branch, or provide one
+value per edge. Empty channels are unconstrained. Older experimental files that
+treated these values as force bounds must divide them by target lengths.</li>
+<li><b>MaxIter</b> — inner iteration budget for Clarabel, SPG, and LSQR.
+It is independent of GNiter.</li>
+<li><b>Tol</b> — inner-solver tolerance and early stopping tolerance for CWLS-GN.</li>
 </ul>
 
 <br/>
@@ -663,15 +677,13 @@ internal enum ParticularMode
 
 internal enum LinearAlgebraMode { Direct = 0, Iterative = 1 }
 
-/// <summary>Residual the inverse solve minimizes. Values match the native ABI.</summary>
+/// <summary>Residual family exposed by the component.</summary>
 internal enum MetricMode
 {
     /// <summary>Minimize the force residual ‖Mx − p‖.</summary>
     Force = 0,
-    /// <summary>Minimize the geometric error with the Jacobian frozen at the target.</summary>
-    Geometry = 1,
-    /// <summary>Minimize the geometric error with the Jacobian at the current geometry.</summary>
-    GeometryNewton = 2,
+    /// <summary>Minimize compliance-weighted geometric error.</summary>
+    Geometric = 1,
 }
 
 internal enum ActiveInverseEngine
@@ -688,6 +700,20 @@ internal enum ActiveInverseEngine
 internal static class InverseFdmUiState
 {
     internal const ParticularMode DefaultParticular = ParticularMode.Clarabel;
+    internal const MetricMode DefaultMetric = MetricMode.Geometric;
+    internal const int DefaultGnIterations = 3;
+    internal const bool DefaultSolveForQ = false;
+
+    internal static int NativeMetric(MetricMode metric, int gnIterations) =>
+        metric switch
+        {
+            MetricMode.Force => 0,
+            _ when gnIterations <= 0 => 1,
+            _ => 2,
+        };
+
+    internal static int GeometricIterationBudget(MetricMode metric, int gnIterations) =>
+        metric == MetricMode.Force ? 0 : Math.Max(1, gnIterations);
 
     internal static bool HasEffectiveBounds(
         IReadOnlyList<int> signs,
@@ -696,6 +722,15 @@ internal static class InverseFdmUiState
         signs.Any(sign => sign != 0)
         || lower.Any(double.IsFinite)
         || upper.Any(double.IsFinite);
+
+    internal static bool HasStrictSignDefiniteBounds(
+        IReadOnlyList<double> lower,
+        IReadOnlyList<double> upper)
+    {
+        bool allPositive = lower.Count > 0 && lower.All(value => value > 0.0);
+        bool allNegative = upper.Count > 0 && upper.All(value => value < 0.0);
+        return allPositive || allNegative;
+    }
 
     internal static ParticularMode UpdateParticular(
         LinearAlgebraMode linearAlgebra,
@@ -706,18 +741,19 @@ internal static class InverseFdmUiState
             : particular;
 
     /// <summary>
-    /// Backends that can carry the Laplacian left weight without densifying.
-    /// Gram and QR would need S⁻¹M formed explicitly.
+    /// Every Stage-1 backend can initialize CWLS because Stage 2 dispatches
+    /// independently to a left-weightable backend.
     /// </summary>
     internal static bool SupportsGeometricMetric(
         LinearAlgebraMode linearAlgebra,
         ParticularMode particular,
-        bool hasEffectiveBounds) =>
-        ResolveEngine(linearAlgebra, particular, hasEffectiveBounds) switch
-        {
-            ActiveInverseEngine.Gram or ActiveInverseEngine.QrLeastSquares => false,
-            _ => true,
-        };
+        bool hasEffectiveBounds)
+    {
+        _ = linearAlgebra;
+        _ = particular;
+        _ = hasEffectiveBounds;
+        return true;
+    }
 
     internal static int NativeParticularMethod(ParticularMode particular) =>
         particular switch
